@@ -1,0 +1,44 @@
+name: Publish Docker Image
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Determine floating tag
+        id: floating
+        run: |
+          if [ "${{ github.ref_name }}" = "dev" ] && [ "${{ github.ref_type }}" = "branch" ]; then
+            echo "tag=dev" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/abyssaloath/abyssal-seclog:${{ steps.version.outputs.version }}
+            ghcr.io/abyssaloath/abyssal-seclog:${{ steps.floating.outputs.tag }}

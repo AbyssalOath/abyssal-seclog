@@ -1,0 +1,437 @@
+<h1>Settings</h1>
+<div id="settings-access-result"></div>
+
+<div id="settings-content" style="display:none;">
+    <div class="tabs">
+        <a href="#" id="tab-link-preferences" onclick="event.preventDefault(); showTab('preferences')">Preferences</a>
+        <a href="#" id="tab-link-general" onclick="event.preventDefault(); showTab('general')">General</a>
+        <a href="#" id="tab-link-security" onclick="event.preventDefault(); showTab('security')">Security</a>
+        <a href="#" id="tab-link-alerts" onclick="event.preventDefault(); showTab('alerts')">Alerts</a>
+        <a href="#" id="tab-link-directory" onclick="event.preventDefault(); showTab('directory')">Directory</a>
+    </div>
+
+    <div id="tab-preferences" style="display:none;">
+        <div class="panel">
+            <h2>Display Timezone</h2>
+            <div class="panel-desc">
+                Every timestamp shown in Abyssal SecLog (Dashboard reviews, Audit Log, Directory,
+                Syslog, Archival Storage) renders in this timezone. Saved in this browser, not
+                on your account -- it won't follow you to a different browser or device.
+            </div>
+            <div class="inline-form">
+                <select id="preferred-timezone" onchange="saveTimezonePreference()" style="width:320px;"></select>
+            </div>
+            <div id="timezone-preview" class="hint"></div>
+            <div id="preferences-result" class="hint"></div>
+        </div>
+    </div>
+
+    <div id="tab-general" style="display:none;">
+        <div class="panel">
+            <h2>Account Access</h2>
+            <div class="panel-desc">Control how new accounts get created.</div>
+            <label class="switch-row">
+                Allow self-signup (new accounts can register themselves)
+                <span class="switch">
+                    <input type="checkbox" id="self-signup-toggle" onchange="updateSelfSignup()">
+                    <span class="switch-slider"></span>
+                </span>
+            </label>
+            <div id="general-result"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Log Retention</h2>
+            <div class="panel-desc">Automatic cleanup runs every 15 minutes. Rows are dropped once they exceed either limit below, whichever comes first -- the row cap is your backstop against a noisy or misbehaving source filling up storage faster than the day-based window would clear it.</div>
+            <div class="inline-form">
+                <label>Delete logs older than
+                    <input type="number" id="retention-days" min="1" style="width:5rem;"> days
+                </label>
+            </div>
+            <div class="inline-form">
+                <label>Keep at most
+                    <input type="number" id="retention-max-rows" min="1000" step="1000" style="width:8rem;"> rows total
+                </label>
+            </div>
+            <button onclick="saveRetentionSettings()">Save Retention Settings</button>
+            <div id="log-table-size" class="hint" style="margin-top:0.75rem;"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Archival Storage</h2>
+            <div class="panel-desc">
+                When enabled, logs that Retention above is about to delete are uploaded as a
+                dated JSON Lines file first -- if the upload fails, that cycle's delete is
+                skipped entirely rather than losing the rows. Credentials are encrypted at
+                rest and never sent back to this page once saved.
+            </div>
+
+            <div id="archive-master-key-warning" class="hint" style="display:none; color:var(--blood-bright);">
+                SECLOG_MASTER_KEY is not set on the server -- a secret can't be saved until an
+                administrator sets it (see README: Directory sync).
+            </div>
+
+            <div class="inline-form">
+                <label style="margin:0;">Backend
+                    <select id="archive-backend" onchange="renderArchiveFields()" style="margin-left:0.5rem;">
+                        <option value="none">None (disabled)</option>
+                        <option value="s3">S3-compatible</option>
+                        <option value="sftp">SFTP</option>
+                    </select>
+                </label>
+            </div>
+
+            <div id="archive-fields-s3" style="display:none;">
+                <div class="inline-form">
+                    <input id="archive-s3-endpoint" placeholder="https://s3.us-east-1.amazonaws.com or http://minio:9000" style="width:380px;">
+                </div>
+                <div class="inline-form">
+                    <input id="archive-s3-bucket" placeholder="Bucket name" style="width:220px;">
+                    <input id="archive-s3-region" placeholder="Region, e.g. us-east-1" style="width:180px;">
+                </div>
+                <div class="inline-form">
+                    <input id="archive-s3-access-key" placeholder="Access key">
+                    <input id="archive-s3-secret-key" type="password" placeholder="Secret key">
+                    <span id="archive-s3-secret-status" class="hint" style="margin:0;"></span>
+                </div>
+                <label class="switch-row" style="max-width:320px;">
+                    Path-style addressing (needed for MinIO/most self-hosted S3)
+                    <span class="switch">
+                        <input type="checkbox" id="archive-s3-path-style" checked>
+                        <span class="switch-slider"></span>
+                    </span>
+                </label>
+            </div>
+
+            <div id="archive-fields-sftp" style="display:none;">
+                <div class="inline-form">
+                    <input id="archive-sftp-host" placeholder="Host" style="width:220px;">
+                    <input id="archive-sftp-port" type="number" value="22" style="width:6rem;">
+                    <input id="archive-sftp-username" placeholder="Username" style="width:160px;">
+                </div>
+                <div class="inline-form">
+                    <input id="archive-sftp-password" type="password" placeholder="Password (leave blank if using a key)">
+                    <span id="archive-sftp-password-status" class="hint" style="margin:0;"></span>
+                </div>
+                <div class="inline-form">
+                    <textarea id="archive-sftp-private-key" placeholder="Private key (PEM, leave blank if using a password)" style="height:80px;"></textarea>
+                </div>
+                <div class="hint" id="archive-sftp-key-status"></div>
+                <div class="inline-form">
+                    <input id="archive-sftp-remote-path" placeholder="Remote directory, e.g. /backups/abyssal-seclog" style="width:320px;">
+                </div>
+                <div class="hint">Host key is not verified -- only point this at a host on a trusted network. See ARCHITECTURE.md.</div>
+            </div>
+
+            <div class="inline-form">
+                <button onclick="saveArchiveConfig()">Save</button>
+                <button onclick="testArchiveConnection()" style="background:transparent; border-color:var(--border); color:var(--text-dim);">Test Connection</button>
+            </div>
+            <div id="archive-config-result" class="hint" style="margin-top:0.5rem;"></div>
+            <div id="archive-status" class="hint"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Agent Health</h2>
+            <div class="panel-desc">Checked every 5 minutes. An agent that goes this long without checking in fires a system alert (Settings &rarr; Alerts) -- once per episode, not repeatedly while still dark.</div>
+            <div class="inline-form">
+                <label>Alert if an agent hasn't checked in for
+                    <input type="number" id="stale-agent-minutes" min="5" style="width:6rem;"> minutes
+                </label>
+            </div>
+            <button onclick="saveStaleAgentMinutes()">Save</button>
+        </div>
+    </div>
+
+    <div id="tab-security" style="display:none;">
+        <div class="panel">
+            <h2>Multi-Factor Authentication</h2>
+            <div class="panel-desc">Protect your own account with a TOTP authenticator app (Aegis, Google Authenticator, Authy, 1Password, etc).</div>
+
+            <div id="mfa-status-off">
+                <div id="mfa-off-label" style="color:var(--text-dim); font-size:0.85rem; margin-bottom:0.75rem;">MFA is currently <strong style="color:var(--blood-bright);">disabled</strong> on your account.</div>
+                <button onclick="startMfaSetup()">Enable MFA</button>
+            </div>
+
+            <div id="mfa-status-on" style="display:none;">
+                <div style="color:var(--text-dim); font-size:0.85rem; margin-bottom:0.75rem;">MFA is currently <strong style="color:#4caf50;">enabled</strong> on your account.</div>
+                <input id="mfa-disable-password" type="password" placeholder="Current password to disable">
+                <button onclick="disableMfa()">Disable MFA</button>
+            </div>
+
+            <div id="mfa-setup-flow" style="display:none; margin-top:1rem;">
+                <div class="hint" style="margin-bottom:0.75rem;">
+                    Scan this QR code with your authenticator app. In Aegis: tap the "+" button &rarr; "Scan a QR code".
+                </div>
+                <div id="mfa-qr-container" style="background:#fff; padding:1rem; display:inline-block; border-radius:4px;">
+                    <canvas id="mfa-qr-canvas"></canvas>
+                </div>
+                <div class="hint" style="margin:0.75rem 0 0.25rem;">
+                    Can't scan? Enter this key manually (Aegis: "+" &rarr; "Enter secret manually"):
+                </div>
+                <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.75rem;">
+                    <code id="mfa-manual-secret" style="background:#0d0b0a; border:1px solid var(--border); padding:0.5rem 0.75rem; border-radius:3px; letter-spacing:0.08em; word-break:break-all;"></code>
+                    <button id="mfa-copy-secret" onclick="copyMfaSecret()">Copy</button>
+                </div>
+                <div class="inline-form">
+                    <input id="mfa-verify-code" placeholder="6-digit code" maxlength="6" inputmode="numeric">
+                    <button onclick="confirmMfaSetup()">Confirm &amp; Enable</button>
+                    <button onclick="cancelMfaSetup()" style="background:transparent; border-color:var(--border); color:var(--text-dim);">Cancel</button>
+                </div>
+            </div>
+
+            <div id="mfa-result" style="color:var(--blood-bright); margin-top:0.5rem; font-size:0.85rem;"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Users</h2>
+            <div class="panel-desc">New accounts get a temporary password and must change it on first login.</div>
+
+            <div class="inline-form">
+                <input id="new-user-username" placeholder="Username">
+                <select id="new-user-role">
+                    <option value="user">User</option>
+                    <option value="auditor">Auditor</option>
+                    <option value="admin">Admin</option>
+                </select>
+                <button onclick="createUser()">Add User</button>
+            </div>
+            <div id="create-user-result"></div>
+
+            <table>
+                <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Auth</th><th></th></tr></thead>
+                <tbody id="user-rows"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="tab-alerts" style="display:none;">
+        <div class="panel">
+            <h2>Correlation Rules</h2>
+            <div class="panel-desc">
+                Threshold detection over the same labeled detections already shown on the
+                Dashboard -- e.g. 5 "SSH failed login" events from one host within 5 minutes.
+                The label is picked from the existing detection rule set, not free text, so a
+                rule can't reference anything Abyssal SecLog doesn't already recognize. Checked every
+                60 seconds; fires once per burst, not on every check while it's ongoing.
+            </div>
+
+            <div class="inline-form">
+                <input id="corr-name" placeholder="Rule name" style="width:220px;">
+                <select id="corr-label" style="width:220px;"></select>
+                <select id="corr-group-by">
+                    <option value="host">Per host</option>
+                    <option value="user">Per user</option>
+                </select>
+            </div>
+            <div class="inline-form">
+                <label style="margin:0;">At least
+                    <input id="corr-threshold" type="number" min="2" value="5" style="width:5rem; margin-left:0.5rem;">
+                    events within
+                    <input id="corr-window" type="number" min="1" value="5" style="width:5rem; margin-left:0.5rem;"> min
+                </label>
+                <select id="corr-severity">
+                    <option value="Low">Low</option>
+                    <option value="Medium">Medium</option>
+                    <option value="High" selected>High</option>
+                    <option value="Critical">Critical</option>
+                </select>
+                <button onclick="createCorrelationRule()">Add Rule</button>
+            </div>
+            <div id="corr-result" class="hint"></div>
+
+            <table style="margin-top:1rem;">
+                <thead>
+                    <tr>
+                        <th>Name</th><th>Label</th><th>Group</th><th>Threshold</th><th>Window</th>
+                        <th>Severity</th><th>Enabled</th><th></th>
+                    </tr>
+                </thead>
+                <tbody id="corr-rule-rows"></tbody>
+            </table>
+        </div>
+
+    	<div class="panel">
+            <h2>Add Notification Channel</h2>
+            <div class="panel-desc">Fires whenever a new detection reaches this severity or higher.</div>
+
+            <div class="inline-form">
+            	<input id="channel-name" placeholder="Channel name (e.g. Ops Slack)">
+            	<select id="channel-kind" onchange="renderChannelFields()">
+                    <option value="email">Email (SMTP)</option>
+                    <option value="slack">Slack</option>
+                    <option value="discord">Discord</option>
+                    <option value="telegram">Telegram</option>
+                    <option value="ntfy">ntfy</option>
+                    <option value="webhook">Generic Webhook</option>
+            	</select>
+            	<select id="channel-min-severity">
+                    <option value="Low">Low and above</option>
+                    <option value="Medium" selected>Medium and above</option>
+                    <option value="High">High and above</option>
+                    <option value="Critical">Critical only</option>
+            	</select>
+            </div>
+
+            <div id="channel-fields"></div>
+
+            <button onclick="createNotificationChannel()">Add Channel</button>
+            <div id="channel-result"></div>
+    	</div>
+
+    	<div class="panel">
+            <h2>Channels</h2>
+            <table>
+            	<thead><tr><th>Name</th><th>Kind</th><th>Min Severity</th><th></th><th></th></tr></thead>
+            	<tbody id="channel-rows"></tbody>
+            </table>
+    	</div>
+    </div>
+
+    <div id="tab-directory" style="display:none;">
+        <div class="panel">
+            <h2>LDAP / Active Directory Connection</h2>
+            <div class="panel-desc">
+                Read-only. Abyssal SecLog binds and searches for computer objects on the schedule below --
+                it never connects to a discovered machine itself. To get the shipper onto one,
+                use its enrollment token from the table below (same one-time-token flow as Agents).
+            </div>
+
+            <div id="directory-master-key-warning" class="hint" style="display:none; color:var(--blood-bright);">
+                SECLOG_MASTER_KEY is not set on the server -- a bind password can't be saved until an
+                administrator sets it (see README: Directory sync).
+            </div>
+
+            <div class="inline-form">
+                <input id="ldap-server-uri" placeholder="ldaps://dc01.corp.example.com:636" style="width:320px;">
+            </div>
+            <div class="inline-form">
+                <input id="ldap-bind-dn" placeholder="Bind DN, e.g. CN=abyssal-seclog-ro,OU=Service Accounts,DC=corp,DC=example,DC=com" style="width:480px;">
+            </div>
+            <div class="inline-form">
+                <input id="ldap-bind-password" type="password" placeholder="Bind password">
+                <span id="ldap-password-status" class="hint" style="margin:0;"></span>
+            </div>
+            <div class="inline-form">
+                <input id="ldap-base-dn" placeholder="Base DN, e.g. OU=Computers,DC=corp,DC=example,DC=com" style="width:420px;">
+            </div>
+            <div class="inline-form">
+                <input id="ldap-computer-filter" placeholder="(objectClass=computer)" style="width:260px;">
+                <label style="margin:0;">Sync every
+                    <input id="ldap-sync-interval" type="number" min="5" style="width:5rem; margin-left:0.5rem;"> min
+                </label>
+            </div>
+            <label class="switch-row" style="max-width:260px; margin-bottom:1rem;">
+                Enabled
+                <span class="switch">
+                    <input type="checkbox" id="ldap-enabled-toggle">
+                    <span class="switch-slider"></span>
+                </span>
+            </label>
+
+            <div class="inline-form">
+                <button onclick="saveDirectoryConfig()">Save</button>
+                <button onclick="testDirectoryConnection()" style="background:transparent; border-color:var(--border); color:var(--text-dim);">Test Connection</button>
+                <button onclick="syncDirectoryNow()" style="background:transparent; border-color:var(--border); color:var(--text-dim);">Sync Now</button>
+            </div>
+            <div id="directory-config-result" class="hint" style="margin-top:0.5rem;"></div>
+            <div id="directory-sync-status" class="hint"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Directory Login</h2>
+            <div class="panel-desc">
+                Let people sign in with their domain username and password instead of a local
+                Abyssal SecLog account. Uses the same connection above to look the person up, then binds
+                as them with the password they entered to verify it -- Abyssal SecLog never sees or stores
+                it. A local account with the same username always wins; the directory is only
+                consulted when no local account exists yet.
+            </div>
+
+            <div class="inline-form">
+                <input id="ldap-user-base-dn" placeholder="User base DN, e.g. OU=People,DC=corp,DC=example,DC=com" style="width:420px;">
+            </div>
+            <div class="inline-form">
+                <input id="ldap-user-filter" placeholder="(&amp;(objectClass=user)(sAMAccountName={username}))" style="width:420px;">
+            </div>
+            <div class="hint">The literal text <code>{username}</code> is replaced with whatever was typed on the login screen.</div>
+            <div class="inline-form">
+                <input id="ldap-admin-group-dn" placeholder="Admin group DN (optional), e.g. CN=Abyssal SecLog Admins,OU=Groups,DC=corp,DC=example,DC=com" style="width:420px;">
+            </div>
+            <div class="hint">Members of this group (via memberOf) get the admin role on login. Leave blank and nobody signs in as admin through the directory.</div>
+
+            <label class="switch-row" style="max-width:320px; margin-bottom:0.5rem;">
+                Allow login with directory credentials
+                <span class="switch">
+                    <input type="checkbox" id="ldap-login-enabled-toggle">
+                    <span class="switch-slider"></span>
+                </span>
+            </label>
+            <div class="hint">Saved together with the connection settings above -- use the same Save button.</div>
+        </div>
+
+        <div class="panel">
+            <h2>Deployment Packages</h2>
+            <div class="panel-desc">
+                A headless install script for pushing the shipper to many machines at once via
+                Group Policy (Computer Startup Script) or Intune (Platform Script), instead of
+                copy-pasting the one-time install command onto every host by hand. Unlike the
+                per-host token above, this one can enroll multiple machines within a use limit
+                and expiry you choose. "OU" is a label for your own bookkeeping only -- Abyssal SecLog
+                can't verify a machine running the script is actually in that OU.
+            </div>
+
+            <div class="inline-form">
+                <label style="margin:0;">Label (e.g. an OU name)
+                    <input id="deploy-label" list="deploy-ou-options" placeholder="OU=Workstations,DC=corp,DC=example,DC=com" style="width:340px; margin-left:0.5rem;">
+                </label>
+                <datalist id="deploy-ou-options"></datalist>
+            </div>
+            <div class="inline-form">
+                <label style="margin:0;">Max uses
+                    <input id="deploy-max-uses" type="number" min="1" value="50" style="width:6rem; margin-left:0.5rem;">
+                </label>
+                <label style="margin:0;">Expires in
+                    <input id="deploy-expires-days" type="number" min="1" value="30" style="width:6rem; margin-left:0.5rem;"> days
+                </label>
+                <button onclick="generateDeploymentPackage()">Generate Package</button>
+            </div>
+            <div id="deploy-package-result" style="display:none; margin-top:0.75rem;"></div>
+
+            <table style="margin-top:1rem;">
+                <thead>
+                    <tr>
+                        <th>Label</th>
+                        <th>Uses</th>
+                        <th>Created</th>
+                        <th>Expires</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody id="deploy-token-rows"></tbody>
+            </table>
+        </div>
+
+        <div class="panel">
+            <h2>Discovered Computers</h2>
+            <div class="hint" style="margin:-0.25rem 0 1rem; font-size:0.8rem;">
+                "Likely enrolled" is a best-effort match on hostname, not a guarantee -- confirm against
+                Agents if it matters. Generating a token here works exactly like the one on the Agents page.
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Hostname</th>
+                        <th>Organizational Unit</th>
+                        <th>OS</th>
+                        <th>Last Seen in AD</th>
+                        <th>Status</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody id="directory-host-rows"></tbody>
+            </table>
+            <div id="directory-token-result" class="panel" style="display:none;"></div>
+        </div>
+    </div>
+</div>

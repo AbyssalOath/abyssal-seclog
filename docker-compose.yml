@@ -1,0 +1,78 @@
+services:
+  mariadb:
+    image: mariadb:11
+    container_name: seclog-db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASS}
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASS}
+    ports:
+      - "3306:3306"
+    volumes:
+      - seclog_db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+ 
+  app:
+    image: ghcr.io/abyssaloath/abyssal-seclog:latest
+    container_name: seclog-app
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      # Note: "mariadb" here is the DB's service name above, not 127.0.0.1 --
+      # inside Docker's internal network, containers reach each other by
+      # service name, not localhost. This is an important shift from how
+      # your Rust binary connected to it during local (non-Docker) testing.
+      DATABASE_URL: mysql://${DB_USER}:${DB_PASS}@mariadb:3306/${DB_NAME}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
+      # Optional -- only needed if Directory (LDAP/AD) sync is turned on.
+      # install.sh generates one into .env regardless, so it's already
+      # there if/when it's needed.
+      SECLOG_MASTER_KEY: ${SECLOG_MASTER_KEY:-}
+    ports:
+      - "3000:3000"
+      # Only relevant if the Syslog receiver (Syslog page) is turned on
+      # -- the app doesn't bind these unless enabled_udp/enabled_tcp are
+      # set, but the container port has to be published regardless for
+      # a device to ever reach it. Like the DB port above, this is a
+      # fixed mapping, not admin-configurable from the dashboard.
+      - "514:514/udp"
+      - "514:514/tcp"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+ 
+  # Optional. Only starts if the "caddy" profile is active, which install.sh
+  # sets via COMPOSE_PROFILES in .env when you choose to let it manage TLS.
+  # If you're fronting Abyssal SecLog with your own reverse proxy (NGINX Proxy
+  # Manager, Traefik, etc.) instead, leave this profile off and point your
+  # proxy at app:3000 -- see README for why HTTPS on the browser-facing hop
+  # is required.
+  caddy:
+    image: caddy:2
+    container_name: seclog-caddy
+    restart: unless-stopped
+    profiles: ["caddy"]
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - seclog_caddy_data:/data
+      - seclog_caddy_config:/config
+ 
+volumes:
+  seclog_db_data:
+  seclog_caddy_data:
+  seclog_caddy_config:
