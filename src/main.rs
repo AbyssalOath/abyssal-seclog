@@ -2458,6 +2458,31 @@ fi
 sudo mv /tmp/seclog-shipper /opt/seclog-shipper/shipper
 sudo chmod +x /opt/seclog-shipper/shipper
 
+# SELinux (Fedora/RHEL/Rocky/AlmaLinux): systemd's ExecStart silently
+# refuses to run a binary carrying the wrong context (e.g. user_tmp_t,
+# inherited from /tmp) -- the failure shows up later as `203/EXEC` in
+# `systemctl status`, with no explanation there. Only relevant if SELinux
+# is actually enabled on this host.
+if command -v getenforce &> /dev/null && [ "$(getenforce)" != "Disabled" ]; then
+    if ! command -v semanage &> /dev/null && command -v dnf &> /dev/null; then
+        echo "Installing policycoreutils-python-utils (needed for SELinux labeling)..."
+        sudo dnf install -y policycoreutils-python-utils
+    fi
+    if command -v semanage &> /dev/null; then
+        # -a adds a new fcontext rule; -m updates one that's already there
+        # (e.g. on a reinstall). restorecon alone can't fix this because it
+        # only applies whatever rule already exists for this exact path, and
+        # most hosts have none for /opt/seclog-shipper until semanage adds it.
+        sudo semanage fcontext -a -t bin_t "/opt/seclog-shipper/shipper" 2>/dev/null || \
+            sudo semanage fcontext -m -t bin_t "/opt/seclog-shipper/shipper"
+        sudo restorecon -v /opt/seclog-shipper/shipper
+    else
+        echo "WARNING: SELinux is enabled but 'semanage' isn't available and"
+        echo "couldn't be installed automatically. The shipper may fail to"
+        echo "start with a 203/EXEC status -- see the README's SELinux section."
+    fi
+fi
+
 # Read from the actual terminal, not stdin -- stdin here is the pipe
 # from `curl | bash`, which is already closed/empty by this point.
 read -p "Enter enrollment token: " TOKEN < /dev/tty
@@ -2519,6 +2544,59 @@ Write-Host "Downloaded. Run C:\seclog-shipper.exe as Administrator to start, or 
 "#,
         base_url = base_url
     );
+
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+        script,
+    )
+}
+
+// Served from the "Remove" button on the Agents page, once the agent
+// record itself is already deleted server-side -- this just cleans up
+// what's left running on the machine. No enrollment token or base URL
+// needed since it never talks back to the API.
+async fn linux_uninstall_script() -> impl axum::response::IntoResponse {
+    let script = r#"#!/bin/bash
+set -e
+
+echo "Uninstalling Abyssal SecLog shipper..."
+
+if systemctl is-active --quiet seclog-shipper 2>/dev/null; then
+    sudo systemctl stop seclog-shipper
+fi
+sudo systemctl disable seclog-shipper 2>/dev/null || true
+sudo rm -f /etc/systemd/system/seclog-shipper.service
+sudo systemctl daemon-reload
+sudo rm -rf /opt/seclog-shipper
+
+echo "Done. The shipper has been removed from this machine."
+"#;
+
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/x-shellscript")],
+        script,
+    )
+}
+
+async fn windows_uninstall_script() -> impl axum::response::IntoResponse {
+    let script = r#"$ErrorActionPreference = "Stop"
+
+Write-Host "Uninstalling Abyssal SecLog shipper..."
+
+if (Get-ScheduledTask -TaskName "SeclogShipper" -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName "SeclogShipper" -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName "SeclogShipper" -Confirm:$false
+}
+
+Get-Process -Name "seclog-shipper" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+[Environment]::SetEnvironmentVariable("SHIPPER_API_URL", $null, "Machine")
+[Environment]::SetEnvironmentVariable("SECLOG_ENROLLMENT_TOKEN", $null, "Machine")
+
+Remove-Item -Path "C:\seclog-shipper.exe" -Force -ErrorAction SilentlyContinue
+
+Write-Host "Done. The shipper has been removed from this machine."
+"#;
 
     (
         [(axum::http::header::CONTENT_TYPE, "text/plain")],
@@ -3022,6 +3100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/version", get(version))
         .route("/install/linux.sh", get(linux_install_script))
         .route("/install/windows.ps1", get(windows_install_script))
+        .route("/uninstall/linux.sh", get(linux_uninstall_script))
+        .route("/uninstall/windows.ps1", get(windows_uninstall_script))
         .fallback_service(ServeDir::new("static"))
         .with_state(state)
         .layer(cors)

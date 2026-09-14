@@ -137,10 +137,13 @@ present before deploying the installer.
 > configuration is needed for those sources.
 
 > **SELinux (Fedora/RHEL/Rocky/AlmaLinux):** the install script relabels
-> the shipper binary automatically, but if the service still fails to
-> start with a `203/EXEC` status in `systemctl status seclog-shipper`,
-> check `ls -Z /opt/seclog-shipper/shipper` for a context like
-> `user_tmp_t`. Fix it with:
+> the shipper binary automatically when it detects SELinux is enabled,
+> installing `policycoreutils-python-utils` first if `semanage` isn't
+> already present. If the service still fails to start with a `203/EXEC`
+> status in `systemctl status seclog-shipper` (e.g. the script couldn't
+> install that package on an air-gapped host), check
+> `ls -Z /opt/seclog-shipper/shipper` for a context like `user_tmp_t`.
+> Fix it with:
 > ```bash
 > sudo semanage fcontext -a -t bin_t "/opt/seclog-shipper/shipper"
 > sudo restorecon -v /opt/seclog-shipper/shipper
@@ -152,6 +155,16 @@ present before deploying the installer.
 > whatever the policy database already maps that exact path to, and most
 > systems have no existing rule for `/opt/seclog-shipper`. `semanage`
 > registers that rule first, which is what `restorecon` then applies.
+
+## Removing an agent
+
+1. Log in as admin → **Agents** → **Remove** next to the agent, then
+   confirm. This deletes the agent record and revokes its API key
+   immediately, but leaves the shipper installed on the machine itself.
+2. To also uninstall the shipper software, run the command shown after
+   the confirm on the machine itself:
+   - **Linux:** `curl -sL http://<server>:3000/uninstall/linux.sh | bash`
+   - **Windows:** `iwr http://<server>:3000/uninstall/windows.ps1 | iex`
 
 ### Recommended Linux log paths
 

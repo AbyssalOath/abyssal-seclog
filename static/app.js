@@ -391,7 +391,7 @@ async function loadAgents() {
         const deleteCell = document.createElement('td');
         const deleteBtn = document.createElement('button');
         deleteBtn.textContent = 'Remove';
-        deleteBtn.onclick = () => deleteAgent(agent.id);
+        deleteBtn.onclick = () => deleteAgent(agent.id, agent.hostname);
         deleteCell.appendChild(deleteBtn);
 
         row.appendChild(idCell);
@@ -403,15 +403,35 @@ async function loadAgents() {
     }
 }
 
-async function deleteAgent(agentId) {
-    if (!confirm('Remove this agent? Its API key will stop working immediately.')) return;
+async function deleteAgent(agentId, hostname) {
+    if (!confirm(`Remove agent "${hostname}"? Its API key will stop working immediately.`)) return;
 
     const response = await authFetch(`/agents/${agentId}`, { method: 'DELETE' });
     if (response.ok) {
+        showUninstallCommands(hostname);
         loadAgents();
     } else {
         alert('Failed to remove agent: ' + response.status);
     }
+}
+
+// Deleting the agent record only revokes its API key server-side -- the
+// shipper binary/service is still sitting on that machine until someone
+// removes it. Point at the uninstall scripts the same way
+// generateEnrollmentToken() points at the install ones.
+function showUninstallCommands(hostname) {
+    const origin = window.location.origin;
+    const result = document.getElementById('uninstall-result');
+
+    result.innerHTML =
+        `Agent "<span id="uninstall-hostname"></span>" removed from the dashboard. ` +
+        `The shipper software is still running on that machine -- to remove it too, ` +
+        `run one of these on the machine itself:<br><br>` +
+        `<strong>Linux (sudo/root required):</strong><br><code>curl -sL ${origin}/uninstall/linux.sh | bash</code><br><br>` +
+        `<strong>Windows (PowerShell, as Administrator):</strong><br><code>iwr ${origin}/uninstall/windows.ps1 | iex</code>`;
+
+    // textContent, not innerHTML -- hostname is agent-supplied data, never markup.
+    document.getElementById('uninstall-hostname').textContent = hostname;
 }
 
 function selectAgent(agentId, hostname) {
