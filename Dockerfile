@@ -13,6 +13,21 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY VERSION ./VERSION
 
+# seclog-ebpf-common/seclog-ebpf are workspace members (see the root
+# Cargo.toml's `[workspace]` table, added for the optional `telemetry`
+# feature) -- Cargo has to load every member's manifest to resolve the
+# workspace at all, even though this default (no --features telemetry)
+# build never compiles their source or touches the eBPF toolchain
+# (build.rs no-ops without that feature, see its own #[cfg]). Without
+# these two COPYs, `cargo build` fails immediately at workspace-manifest
+# loading, before it even gets to deciding what to build -- hit and fixed
+# via an actual `docker build`, not just `cargo build` from the repo
+# root, which doesn't reproduce this (the directories already exist
+# there).
+COPY seclog-ebpf-common ./seclog-ebpf-common
+COPY seclog-ebpf ./seclog-ebpf
+COPY build.rs ./build.rs
+
 # Builds all binaties in the project (main + shipped) in release mode
 # (optimized, slower to compile, much faster to run than a debug build).
 RUN cargo build --release
