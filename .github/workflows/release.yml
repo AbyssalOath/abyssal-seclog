@@ -17,16 +17,23 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: shipper
             asset_name: shipper-linux-x86_64
+            # Only the Linux shipper gets the eBPF telemetry sensor -- see
+            # the `telemetry` feature comment in Cargo.toml. Windows/macOS
+            # builds must never need the eBPF toolchain (nightly, rust-src,
+            # bpf-linker) at all.
+            cargo_features: --features telemetry
 
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: shipper
             asset_name: shipper-macos-x86_64
+            cargo_features: ""
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: shipper.exe
             asset_name: shipper-windows-x86_64.exe
+            cargo_features: ""
 
     runs-on: ${{ matrix.os }}
 
@@ -38,8 +45,28 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # seclog-ebpf compiles via `cargo +nightly build -Z build-std=core
+      # --target bpfel-unknown-none` (see build.rs, driven by aya-build) --
+      # that needs a nightly toolchain with rust-src, plus bpf-linker as
+      # the actual eBPF linker. bpf-linker itself needs LLVM; rather than
+      # install LLVM dev packages on the runner, use the project's own
+      # prebuilt musl release binary (statically linked, no system LLVM
+      # required) -- see https://github.com/aya-rs/bpf-linker#installation.
+      - name: Install eBPF toolchain (Linux telemetry sensor)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup component add rust-src --toolchain nightly
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          zstd -d /tmp/bpf-linker.tar.zst -o /tmp/bpf-linker.tar
+          mkdir -p /tmp/bpf-linker-extract
+          tar -xf /tmp/bpf-linker.tar -C /tmp/bpf-linker-extract
+          chmod +x /tmp/bpf-linker-extract/bpf-linker
+          sudo mv /tmp/bpf-linker-extract/bpf-linker /usr/local/bin/bpf-linker
+
       - name: Build shipper
-        run: cargo build --release --bin shipper --target ${{ matrix.target }}
+        run: cargo build --release --bin shipper --target ${{ matrix.target }} ${{ matrix.cargo_features }}
 
       - name: Prepare release asset
         shell: bash

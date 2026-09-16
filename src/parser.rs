@@ -53,6 +53,35 @@ fn rules() -> &'static Vec<Rule> {
             Rule { pattern: Regex::new(r"type=USER_START").unwrap(), severity: Severity::Low, label: "Session started (audit)" },
             Rule { pattern: Regex::new(r"type=USER_END").unwrap(), severity: Severity::Low, label: "Session ended (audit)" },
 
+            // --- Auditd telemetry fallback (see README/ARCHITECTURE) ---
+            // For hosts the eBPF sensor can't run on (no BTF -- kernels
+            // older than ~5.8, or BTF-stripped builds): four recommended
+            // `auditctl` rules tagged with these exact -k keys, so this
+            // matches the tagged rule regardless of syscall number
+            // (execve is 59 on x86_64 but 221 on arm64 -- matching on an
+            // admin-chosen key string sidesteps that entirely) or which
+            // rule type produced the line (-S syscall-based vs. a -w
+            // file-watch, both attach the same key). This is a much
+            // lower-fidelity substitute for the real sensor -- one
+            // classified `logs` row per event via the existing
+            // text-tailing path, not a structured telemetry_events row,
+            // and with no argv/exe/dst_port extraction here -- but it's
+            // real signal from zero new architecture, and Correlation
+            // Rules (not Telemetry Rules, which only read
+            // telemetry_events) can threshold on these labels exactly
+            // like any other. Recommended rules:
+            //   -a always,exit -F arch=b64 -S execve -k seclog_exec
+            //   -a always,exit -F arch=b64 -S connect -k seclog_connect
+            //   -w /etc/passwd -p wa -k seclog_open   (repeat -w per
+            //     sensitive path -- see the eBPF sensor's own
+            //     WATCHED_FILES list in seclog-ebpf/src/main.rs for a
+            //     starting set)
+            //   -a always,exit -F arch=b64 -S init_module,finit_module -k seclog_module
+            Rule { pattern: Regex::new(r#"type=SYSCALL.*key="seclog_exec""#).unwrap(), severity: Severity::Low, label: "Auditd process exec (fallback)" },
+            Rule { pattern: Regex::new(r#"type=SYSCALL.*key="seclog_connect""#).unwrap(), severity: Severity::Low, label: "Auditd network connect (fallback)" },
+            Rule { pattern: Regex::new(r#"type=SYSCALL.*key="seclog_open""#).unwrap(), severity: Severity::Medium, label: "Auditd sensitive file access (fallback)" },
+            Rule { pattern: Regex::new(r#"type=SYSCALL.*key="seclog_module""#).unwrap(), severity: Severity::Medium, label: "Auditd kernel module load attempt (fallback)" },
+
             // --- SSH / remote access ---
             // Specific phrasing first, generic "Invalid user"/"Failed password"
             // last since several other patterns' text also contains those words.
@@ -481,5 +510,58 @@ mod tests {
         for label in &labels {
             assert!(seen.insert(*label), "duplicate label: {}", label);
         }
+    }
+
+    // Realistic auditd SYSCALL lines tagged with the four recommended
+    // `-k` keys (see the "Auditd telemetry fallback" comment in rules()
+    // above) -- one per key, plus a negative case confirming an
+    // ordinary SYSCALL line (no seclog key, or some other admin's own
+    // unrelated key) doesn't get swept in by an overly broad match.
+    #[test]
+    fn auditd_fallback_matches_recommended_exec_key() {
+        let line = r#"type=SYSCALL msg=audit(1700000000.123:456): arch=c000003e syscall=59 success=yes exit=0 a0=... a1=... a2=... a3=... items=2 ppid=1234 pid=5678 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=1 comm="bash" exe="/usr/bin/bash" subj=unconfined key="seclog_exec""#;
+        let (severity, label) = classify(line);
+        assert_eq!(label, "Auditd process exec (fallback)");
+        assert_eq!(format!("{:?}", severity), "Low");
+    }
+
+    #[test]
+    fn auditd_fallback_matches_recommended_connect_key() {
+        let line = r#"type=SYSCALL msg=audit(1700000000.200:457): arch=c000003e syscall=42 success=yes exit=0 comm="curl" exe="/usr/bin/curl" key="seclog_connect""#;
+        let (_, label) = classify(line);
+        assert_eq!(label, "Auditd network connect (fallback)");
+    }
+
+    #[test]
+    fn auditd_fallback_matches_recommended_open_key_from_a_watch_rule() {
+        // A `-w /etc/shadow -p wa -k seclog_open` file watch also emits a
+        // type=SYSCALL line with the same key mechanism as a -S rule --
+        // the regex doesn't need to (and can't easily) distinguish which
+        // rule type produced it, and doesn't need to.
+        let line = r#"type=SYSCALL msg=audit(1700000000.300:458): arch=c000003e syscall=257 success=yes exit=3 comm="vipw" exe="/usr/sbin/vipw" key="seclog_open""#;
+        let (severity, label) = classify(line);
+        assert_eq!(label, "Auditd sensitive file access (fallback)");
+        assert_eq!(format!("{:?}", severity), "Medium");
+    }
+
+    #[test]
+    fn auditd_fallback_matches_recommended_module_key() {
+        let line = r#"type=SYSCALL msg=audit(1700000000.400:459): arch=c000003e syscall=313 success=yes exit=0 comm="insmod" exe="/usr/sbin/insmod" key="seclog_module""#;
+        let (_, label) = classify(line);
+        assert_eq!(label, "Auditd kernel module load attempt (fallback)");
+    }
+
+    #[test]
+    fn auditd_syscall_line_without_a_seclog_key_is_not_swept_in() {
+        // An admin's own, unrelated audit rule (or the noisy default
+        // rules many distros ship) must not be misclassified as one of
+        // the four fallback events just because it's also a
+        // type=SYSCALL line.
+        let line = r#"type=SYSCALL msg=audit(1700000000.500:460): arch=c000003e syscall=2 success=yes exit=3 comm="cat" exe="/usr/bin/cat" key="some-other-teams-rule""#;
+        let (_, label) = classify(line);
+        assert_ne!(label, "Auditd process exec (fallback)");
+        assert_ne!(label, "Auditd network connect (fallback)");
+        assert_ne!(label, "Auditd sensitive file access (fallback)");
+        assert_ne!(label, "Auditd kernel module load attempt (fallback)");
     }
 }

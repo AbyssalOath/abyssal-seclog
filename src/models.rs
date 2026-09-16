@@ -181,6 +181,75 @@ pub struct AddPathRequest {
 pub struct AgentConfigResponse {
     pub hostname: String,
     pub paths: Vec<String>,
+    // Per-agent opt-in for the Linux eBPF telemetry sensor -- read by the
+    // shipper's config poll loop the same way `paths` already is; ignored
+    // by shipper builds/platforms that don't have the sensor at all. See
+    // db::get_agent_telemetry_enabled.
+    pub telemetry_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetTelemetryEnabledRequest {
+    pub enabled: bool,
+}
+
+// What the shipper's eBPF sensor sends to POST /telemetry/batch. Deliberately
+// a flat struct with kind-specific fields left None, matching NewLogEntry's
+// shape -- see seclog-ebpf-common's module doc comment for why the wire
+// format on the kernel-event side already looks like this.
+#[derive(Debug, Deserialize)]
+pub struct NewTelemetryEvent {
+    pub kind: String,
+    pub host: String,
+    pub pid: i64,
+    pub uid: i64,
+    #[serde(default)]
+    pub exe: Option<String>,
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    #[serde(default)]
+    pub src_ip: Option<String>,
+    #[serde(default)]
+    pub src_port: Option<i32>,
+    #[serde(default)]
+    pub dst_ip: Option<String>,
+    #[serde(default)]
+    pub dst_port: Option<i32>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub event_time: Option<DateTime<Utc>>,
+}
+
+impl NewTelemetryEvent {
+    pub fn is_valid(&self) -> bool {
+        matches!(
+            self.kind.as_str(),
+            "process_exec" | "network_connect" | "file_write" | "module_load"
+        ) && !self.host.trim().is_empty()
+            && self.host.len() <= 255
+            && self.exe.as_ref().is_none_or(|s| s.len() <= 1024)
+            && self.protocol.as_ref().is_none_or(|s| s.len() <= 10)
+            && self.src_ip.as_ref().is_none_or(|s| s.len() <= 45)
+            && self.dst_ip.as_ref().is_none_or(|s| s.len() <= 45)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelemetryQuery {
+    pub host: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaginatedTelemetry {
+    pub events: Vec<crate::db::TelemetryRow>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 #[derive(Debug, Serialize)]

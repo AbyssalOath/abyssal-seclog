@@ -32,6 +32,28 @@ the Git tags (`vX.Y.Z`) that trigger shipper release builds.
 
 ### Added
 
+- **Endpoint telemetry (Linux, experimental)**: an optional eBPF sensor in
+  the shipper captures process-exec (command + args), new outbound
+  network connections, writes to a small set of security-relevant files
+  (file-integrity monitoring), and kernel module loads directly from the
+  kernel, independent of any text log. Off by default, both at the build
+  level (`telemetry` Cargo feature — see README § Building the shipper
+  with the telemetry sensor) and per-agent (Agents page toggle). Raw
+  event stream on the new **Telemetry** page, plus threshold detection
+  over it (Settings → Alerts → **Telemetry Rules**, same shape as
+  Correlation Rules but matching on event kind + `exe`/`dst_port` instead
+  of a `[Label]` prefix) — opt-in per rule, no seeded defaults. Hosts
+  whose kernel can't run the sensor at all (no BTF) get a documented,
+  lower-fidelity `auditd`-based fallback instead — four new detection
+  labels over `type=SYSCALL` lines tagged with recommended `-k` keys, via
+  the existing log-tailing pipeline and Correlation Rules, not a second
+  sensor implementation.
+  See [ARCHITECTURE.md § Endpoint telemetry](ARCHITECTURE.md#endpoint-telemetry-linux-ebpf-seclog-ebpf-seclog-ebpf-common-srcbinshipperebpf_linuxrs)
+  and § Telemetry rules for the full design. (new
+  `seclog-ebpf`/`seclog-ebpf-common` workspace crates, `telemetry_events`
+  and `telemetry_rules` tables, `POST /telemetry/batch`, `GET /telemetry`,
+  `POST /agents/{id}/telemetry`, `GET|POST /telemetry-rules`,
+  `PATCH|DELETE /telemetry-rules/{id}`)
 - **Display timezone**: Settings → **Preferences** lets you pick the
   timezone every timestamp in Abyssal SecLog (Dashboard reviews, Audit Log,
   Directory, Syslog, Archival Storage) renders in, instead of always

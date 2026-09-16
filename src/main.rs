@@ -1472,6 +1472,148 @@ async fn delete_correlation_rule_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- Telemetry rules ---
+// Threshold detection over telemetry_events (the eBPF sensor's structured
+// event table) -- same shape and same 60s sweep as the correlation rules
+// above, just matching on kind/exe/dst_port instead of a [Label] prefix.
+// See db.rs's telemetry_rules section for why this is a second table
+// rather than a generalized correlation_rules.
+
+async fn list_telemetry_rules_handler(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> Result<Json<Vec<db::TelemetryRuleRow>>, StatusCode> {
+    match db::list_telemetry_rules(&state.pool).await {
+        Ok(rows) => Ok(Json(rows)),
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TelemetryRuleRequest {
+    name: String,
+    kind: String,
+    #[serde(default)]
+    match_field: Option<String>,
+    #[serde(default)]
+    match_value: Option<String>,
+    threshold_count: i64,
+    window_minutes: i64,
+    alert_severity: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+// match_value's meaning (and validity) depends entirely on match_field,
+// so unlike validate_correlation_rule this can't be one flat boolean
+// expression -- an "exe contains" rule needs non-empty text, a "dst_port
+// equals" rule needs something that actually parses as a port number,
+// and neither makes sense paired with a kind that doesn't carry that
+// field: "exe" is process_exec's binary path, file_write's watched path,
+// or module_load's module name (all three reuse the same underlying
+// `exe` column -- see seclog-ebpf-common's TelemetryEvent doc comment);
+// "dst_port" only ever exists on a network_connect event.
+fn validate_telemetry_rule(payload: &TelemetryRuleRequest) -> bool {
+    if payload.name.trim().is_empty()
+        || !matches!(payload.kind.as_str(), "process_exec" | "network_connect" | "file_write" | "module_load")
+        || payload.threshold_count < 2
+        || payload.window_minutes < 1
+        || !matches!(payload.alert_severity.as_str(), "Low" | "Medium" | "High" | "Critical")
+    {
+        return false;
+    }
+    match payload.match_field.as_deref() {
+        None => true,
+        Some("exe") => {
+            matches!(payload.kind.as_str(), "process_exec" | "file_write" | "module_load")
+                && payload.match_value.as_deref().is_some_and(|v| !v.trim().is_empty())
+        }
+        Some("dst_port") => {
+            payload.kind == "network_connect"
+                && payload.match_value.as_deref().and_then(|v| v.parse::<u16>().ok()).is_some()
+        }
+        Some(_) => false,
+    }
+}
+
+async fn create_telemetry_rule_handler(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    headers: HeaderMap,
+    Json(payload): Json<TelemetryRuleRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !validate_telemetry_rule(&payload) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let id = db::create_telemetry_rule(
+        &state.pool, &payload.name, &payload.kind, payload.match_field.as_deref(), payload.match_value.as_deref(),
+        payload.threshold_count, payload.window_minutes, &payload.alert_severity,
+    ).await.map_err(|e| {
+        eprintln!("DB error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    db::record_audit_event(
+        &state.pool, Some(admin.user_id), &admin.username, "admin.telemetry_rule.create",
+        Some(&format!("telemetry_rule:{}", id)), "success", &client_ip(&headers),
+        Some(&format!("name={} kind={} match_field={:?} match_value={:?} threshold={} window={}min",
+            payload.name, payload.kind, payload.match_field, payload.match_value, payload.threshold_count, payload.window_minutes)),
+    ).await;
+
+    Ok(StatusCode::CREATED)
+}
+
+async fn update_telemetry_rule_handler(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+    Json(payload): Json<TelemetryRuleRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !validate_telemetry_rule(&payload) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    db::update_telemetry_rule(
+        &state.pool, id, &payload.name, &payload.kind, payload.match_field.as_deref(), payload.match_value.as_deref(),
+        payload.threshold_count, payload.window_minutes, &payload.alert_severity, payload.enabled,
+    ).await.map_err(|e| {
+        eprintln!("DB error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    db::record_audit_event(
+        &state.pool, Some(admin.user_id), &admin.username, "admin.telemetry_rule.update",
+        Some(&format!("telemetry_rule:{}", id)), "success", &client_ip(&headers),
+        Some(&format!("enabled={}", payload.enabled)),
+    ).await;
+
+    Ok(StatusCode::OK)
+}
+
+async fn delete_telemetry_rule_handler(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+) -> Result<StatusCode, StatusCode> {
+    db::delete_telemetry_rule(&state.pool, id).await.map_err(|e| {
+        eprintln!("DB error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    db::record_audit_event(
+        &state.pool, Some(admin.user_id), &admin.username, "admin.telemetry_rule.delete",
+        Some(&format!("telemetry_rule:{}", id)), "success", &client_ip(&headers), None,
+    ).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // --- Directory (LDAP/Active Directory) sync ---
 
 async fn get_directory_config(
@@ -2200,16 +2342,91 @@ async fn get_agent_config(
     State(state): State<AppState>,
     agent: AgentAuth,
 ) -> Result<Json<models::AgentConfigResponse>, StatusCode> {
-    match db::get_enabled_paths(&state.pool, agent.agent_id).await {
-        Ok(paths) => Ok(Json(models::AgentConfigResponse {
-            hostname: agent.hostname,
-            paths,
-        })),
+    let paths = match db::get_enabled_paths(&state.pool, agent.agent_id).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let telemetry_enabled = match db::get_agent_telemetry_enabled(&state.pool, agent.agent_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    Ok(Json(models::AgentConfigResponse {
+        hostname: agent.hostname,
+        paths,
+        telemetry_enabled,
+    }))
+}
+
+// POST /telemetry/batch -- AgentAuth-gated like POST /logs, but bulk: a
+// shipper's eBPF poll loop batches events itself (see ebpf_linux.rs) rather
+// than posting one per HTTP request, so this takes a Vec directly instead
+// of create_log's single NewLogEntry.
+async fn create_telemetry_batch(
+    State(state): State<AppState>,
+    agent: AgentAuth,
+    Json(payload): Json<Vec<models::NewTelemetryEvent>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if payload.len() > 1000 {
+        // A single legitimate batch (2s flush interval, MAX_BATCH=100 on
+        // the shipper side) never approaches this -- reject rather than
+        // silently truncate a hand-crafted oversized request.
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let valid: Vec<models::NewTelemetryEvent> = payload.into_iter().filter(|e| e.is_valid()).collect();
+    if valid.is_empty() {
+        return Ok(Json(serde_json::json!({ "received": 0, "inserted": 0 })));
+    }
+    let received = valid.len();
+    match db::insert_telemetry_batch(&state.pool, &agent.hostname, &valid).await {
+        Ok(inserted) => Ok(Json(serde_json::json!({ "received": received, "inserted": inserted }))),
         Err(e) => {
             eprintln!("DB error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+// GET /telemetry -- AuditAccess-gated like list_logs (CJIS AU-9: this is
+// audit-relevant host activity data, same access model as the log stream),
+// same pagination shape and clamp(1, 500) cap for the same DOM-crash reason
+// documented on list_logs.
+async fn list_telemetry(
+    State(state): State<AppState>,
+    admin: AuditAccess,
+    headers: HeaderMap,
+    Query(params): Query<models::TelemetryQuery>,
+) -> Result<Json<models::PaginatedTelemetry>, StatusCode> {
+    db::record_audit_event(
+        &state.pool, Some(admin.user_id), &admin.username, "audit.telemetry.view",
+        Some(&format!("host:{}", params.host)), "success", &client_ip(&headers), None,
+    ).await;
+
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let kind = params.kind.as_deref();
+
+    let events = match db::get_telemetry_events(&state.pool, &params.host, kind, limit, offset).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let total = match db::count_telemetry_events(&state.pool, &params.host, kind).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    Ok(Json(models::PaginatedTelemetry { events, total, limit, offset }))
 }
 
 async fn list_watched_paths(
@@ -2325,6 +2542,32 @@ async fn set_path_enabled_handler(
             db::record_audit_event(
                 &state.pool, Some(admin.user_id), &admin.username, "admin.path.set_enabled",
                 Some(&format!("path:{}", path_id)), "success", &client_ip(&headers),
+                Some(&format!("enabled={}", payload.enabled)),
+            ).await;
+            Ok(StatusCode::OK)
+        }
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+// Per-agent opt-in for the Linux eBPF telemetry sensor -- mirrors
+// set_path_enabled_handler's shape exactly, just against the agents table
+// instead of watched_paths.
+async fn set_agent_telemetry_handler(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    headers: HeaderMap,
+    Path(agent_id): Path<i32>,
+    Json(payload): Json<models::SetTelemetryEnabledRequest>,
+) -> Result<StatusCode, StatusCode> {
+    match db::set_agent_telemetry_enabled(&state.pool, agent_id, payload.enabled).await {
+        Ok(_) => {
+            db::record_audit_event(
+                &state.pool, Some(admin.user_id), &admin.username, "admin.agent.set_telemetry",
+                Some(&format!("agent:{}", agent_id)), "success", &client_ip(&headers),
                 Some(&format!("enabled={}", payload.enabled)),
             ).await;
             Ok(StatusCode::OK)
@@ -2695,6 +2938,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db::init_correlation_schema(&pool).await?;
     db::init_syslog_schema(&pool).await?;
     db::init_archive_schema(&pool).await?;
+    db::init_telemetry_schema(&pool).await?;
+    db::init_telemetry_rules_schema(&pool).await?;
 
     // Optional, unlike DATABASE_URL/FRONTEND_ORIGIN: a deployment that
     // never touches directory sync shouldn't have to set a new env var
@@ -2782,6 +3027,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             notify::trigger_alert(
                                 &retention_pool, "High",
                                 &format!("[SYSTEM] Retention cleanup (row cap) failed: {}", e),
+                                "abyssal-seclog-server",
+                            ).await;
+                        }
+                    }
+
+                    // Same age-based window as `logs` above, no row-cap
+                    // backstop yet -- see db::delete_telemetry_older_than's
+                    // comment for why. Without this, telemetry_events had
+                    // no eviction at all: an admin turning the sensor on
+                    // for even one host would grow it forever.
+                    match db::delete_telemetry_older_than(&retention_pool, days).await {
+                        Ok(count) if count > 0 => println!("Retention: deleted {} telemetry event(s) older than {} days", count, days),
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("Retention cleanup (telemetry) failed: {}", e);
+                            notify::trigger_alert(
+                                &retention_pool, "High",
+                                &format!("[SYSTEM] Retention cleanup (telemetry) failed: {}", e),
                                 "abyssal-seclog-server",
                             ).await;
                         }
@@ -2958,6 +3221,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let correlation_pool = state.pool.clone();
     tokio::spawn(async move {
         let mut firing: std::collections::HashMap<i32, std::collections::HashSet<String>> = std::collections::HashMap::new();
+        // Separate dedup map for telemetry rules, processed further down
+        // in this same loop/tick -- correlation_rules.id and
+        // telemetry_rules.id are independent, unrelated integer spaces
+        // (different tables), so sharing one HashMap keyed by bare id
+        // would let a telemetry rule and a correlation rule silently
+        // clobber each other's "currently firing" state if they ever
+        // happened to share an id.
+        let mut telemetry_firing: std::collections::HashMap<i32, std::collections::HashSet<String>> = std::collections::HashMap::new();
 
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -2995,6 +3266,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &format!(
                                 "[CORRELATION] {}: {} \"{}\" events from {} in {}min (threshold {})",
                                 rule.name, hit.count, rule.match_label, hit.group_value, rule.window_minutes, rule.threshold_count
+                            ),
+                            &hit.group_value,
+                        ).await;
+                    }
+                }
+
+                *currently_firing = still_firing;
+            }
+
+            // Telemetry rules: same shape and same tick as the
+            // correlation-rule sweep just above, but over
+            // telemetry_events (the eBPF sensor's structured data)
+            // instead of [Label]-prefixed logs.message rows. Kept in
+            // this same task/loop rather than a second tokio::spawn --
+            // nothing is gained from a separate timer, and this is one
+            // fewer background task to reason about.
+            let telemetry_rules = match db::list_telemetry_rules(&correlation_pool).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Telemetry rule sweep: failed to read rules: {}", e);
+                    continue;
+                }
+            };
+
+            for rule in telemetry_rules {
+                if !rule.enabled {
+                    telemetry_firing.remove(&rule.id);
+                    continue;
+                }
+
+                let hits = match db::telemetry_rule_hits(&correlation_pool, &rule).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("Telemetry rule sweep: rule '{}' query failed: {}", rule.name, e);
+                        continue;
+                    }
+                };
+
+                let currently_firing = telemetry_firing.entry(rule.id).or_default();
+                let mut still_firing = std::collections::HashSet::new();
+
+                for hit in hits {
+                    still_firing.insert(hit.group_value.clone());
+                    if !currently_firing.contains(&hit.group_value) {
+                        let match_desc = match rule.match_field.as_deref() {
+                            Some("exe") => format!(" (exe contains \"{}\")", rule.match_value.as_deref().unwrap_or("")),
+                            Some("dst_port") => format!(" (dst_port {})", rule.match_value.as_deref().unwrap_or("?")),
+                            _ => String::new(),
+                        };
+                        notify::trigger_alert(
+                            &correlation_pool, &rule.alert_severity,
+                            &format!(
+                                "[TELEMETRY] {}: {} \"{}\" event(s) from {} in {}min (threshold {}){}",
+                                rule.name, hit.count, rule.kind, hit.group_value, rule.window_minutes, rule.threshold_count, match_desc
                             ),
                             &hit.group_value,
                         ).await;
@@ -3076,7 +3401,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/agents/self-register", post(self_register_agent))
         .route("/agents/{agent_id}", axum::routing::delete(delete_agent_handler))
         .route("/agents/{agent_id}/paths", get(list_watched_paths).post(add_watched_path_handler))
+        .route("/agents/{agent_id}/telemetry", post(set_agent_telemetry_handler))
         .route("/agents/ping", get(agent_ping))
+        .route("/telemetry/batch", post(create_telemetry_batch))
+        .route("/telemetry", get(list_telemetry))
         .route("/notifications", get(list_notification_channels_handler).post(create_notification_channel_handler))
         .route("/notifications/{id}", axum::routing::delete(delete_notification_channel_handler))
         .route("/notifications/{id}/test", post(test_notification_channel_handler))
@@ -3090,6 +3418,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/correlation-rules/labels", get(list_correlation_rule_labels))
         .route("/correlation-rules", get(list_correlation_rules_handler).post(create_correlation_rule_handler))
         .route("/correlation-rules/{id}", axum::routing::patch(update_correlation_rule_handler).delete(delete_correlation_rule_handler))
+        .route("/telemetry-rules", get(list_telemetry_rules_handler).post(create_telemetry_rule_handler))
+        .route("/telemetry-rules/{id}", axum::routing::patch(update_telemetry_rule_handler).delete(delete_telemetry_rule_handler))
         .route("/syslog/config", get(get_syslog_config_handler).post(update_syslog_config_handler))
         .route("/archive/config", get(get_archive_config_handler).post(update_archive_config_handler))
         .route("/archive/test", post(test_archive_connection_handler))

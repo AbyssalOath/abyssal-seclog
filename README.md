@@ -460,12 +460,97 @@ password/private key) are encrypted with `SECLOG_MASTER_KEY` — the same
 mechanism and the same "write-only, shown once" contract already used
 for the LDAP bind password, see Directory sync above.
 
+## Endpoint telemetry (Linux, experimental)
+
+Beyond log-line tailing, the shipper can optionally run a real-time eBPF
+sensor on Linux hosts, capturing four kinds of activity directly from the
+kernel — no text log involved: process-exec (command + args), new outbound
+network connections, writes to a small set of security-relevant files
+(`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `/etc/ssh/sshd_config`,
+`/etc/crontab`, `/root/.ssh/authorized_keys` — file-integrity monitoring),
+and kernel module loads. This is off by default and needs a shipper binary
+built with the `telemetry` Cargo feature (see **Development** below); a
+shipper without it simply never shows the toggle as usable.
+
+Once you have a telemetry-capable shipper deployed:
+
+1. Log in as admin → **Agents** → check **Telemetry** next to the host.
+   Takes effect on that agent's next config poll (~30s), no restart
+   needed.
+2. View the raw event stream on the **Telemetry** page (admin/auditor,
+   same access as the Dashboard and Audit Log).
+3. Optionally add threshold detection under **Settings → Alerts →
+   Telemetry Rules** — e.g. "10 process execs from one host within 2
+   minutes," or "5 connections to the same destination port within 5
+   minutes." Off by default, same as Correlation Rules but with no seeded
+   defaults.
+
+Requires a kernel with BTF (`/sys/kernel/btf/vmlinux`, roughly 5.8+ on
+most distros) — a host without it logs a warning (with a ready-to-use
+`auditd` fallback rule set printed alongside it, see below) and simply
+doesn't start the sensor; every other shipper function keeps working
+normally. Delivery is best-effort (a batch that fails all retries is
+dropped, unlike the log-tailing path's retry-until-success). See
+`ARCHITECTURE.md`'s "Endpoint telemetry" section for the full design.
+
+### Auditd fallback (kernels without BTF)
+
+On a host too old (or too stripped-down) to run the eBPF sensor, add
+`/var/log/audit/audit.log` as a regular watched path on the Agents page
+(same as any other log file) after adding these `auditctl` rules:
+
+```bash
+auditctl -a always,exit -F arch=b64 -S execve -k seclog_exec
+auditctl -a always,exit -F arch=b64 -S connect -k seclog_connect
+auditctl -w /etc/passwd -p wa -k seclog_open
+auditctl -w /etc/shadow -p wa -k seclog_open
+auditctl -w /etc/sudoers -p wa -k seclog_open
+auditctl -w /etc/ssh/sshd_config -p wa -k seclog_open
+auditctl -a always,exit -F arch=b64 -S init_module,finit_module -k seclog_module
+```
+
+This is lower-fidelity than the real sensor (one classified log line per
+event — no argv/exe/destination-port extraction — via the existing
+detection pipeline, not a `telemetry_events` row) and its detections show
+up under **Correlation Rules**, not **Telemetry Rules** (which only ever
+read the sensor's structured data) — but it needs no new toolchain and
+reuses infrastructure this project already has. See ARCHITECTURE.md's
+"Auditd telemetry fallback" section for why matching on the `-k` key
+(rather than a syscall number, which differs by CPU architecture) is what
+makes this portable.
+
 ## Development
 
 ```bash
 cargo run --bin seclog     # server (needs DATABASE_URL in .env)
 cargo run --bin shipper    # shipper, against a local test file
 ```
+
+### Building the shipper with the telemetry sensor
+
+The eBPF sensor is its own Cargo feature, off by default, so it needs a
+one-time toolchain setup that the server and a plain shipper build never
+require:
+
+```bash
+rustup toolchain install nightly --profile minimal
+rustup component add rust-src --toolchain nightly
+
+# bpf-linker needs LLVM to build from source -- the project's own prebuilt
+# musl release binary sidesteps that (statically linked, no system LLVM
+# dev packages needed):
+curl -fsSL -o /tmp/bpf-linker.tar.zst \
+  https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+zstd -d /tmp/bpf-linker.tar.zst -o /tmp/bpf-linker.tar
+mkdir -p /tmp/bpf-linker-extract && tar -xf /tmp/bpf-linker.tar -C /tmp/bpf-linker-extract
+sudo install -m755 /tmp/bpf-linker-extract/bpf-linker /usr/local/bin/bpf-linker
+
+cargo build --release --bin shipper --features telemetry
+```
+
+Loading the sensor needs root (or `CAP_BPF`/`CAP_PERFMON`/`CAP_NET_ADMIN`)
+at runtime — the systemd unit the install script sets up already runs as
+root, so a normal install needs no extra privilege configuration.
 
 ## Security notes
 

@@ -1,6 +1,8 @@
 use crate::auth;
-use crate::models::LogRow;
+use crate::models::{LogRow, NewTelemetryEvent};
+use crate::parser;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+use sqlx::QueryBuilder;
 use chrono::{DateTime, SubsecRound, Utc, Duration};
 
 // A type aloas -- just a shorter name for a long type, purely for readability.
@@ -909,6 +911,14 @@ pub async fn init_agents_schema(pool: &DbPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Per-agent opt-in for the Linux eBPF telemetry sensor (see
+    // telemetry_events below) -- off by default even on a host whose
+    // shipper build supports it, an admin has to turn it on per host from
+    // the Agents page.
+    sqlx::query("ALTER TABLE agents ADD COLUMN IF NOT EXISTS telemetry_enabled BOOLEAN NOT NULL DEFAULT FALSE")
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 
@@ -932,6 +942,7 @@ pub struct AgentRow {
     pub id: i32,
     pub hostname: String,
     pub last_seen: Option<chrono::DateTime<Utc>>,
+    pub telemetry_enabled: bool,
 }
 
 pub async fn create_agent(
@@ -986,7 +997,7 @@ pub async fn touch_agent_last_seen(pool: &DbPool, agent_id: i32) -> Result<(), s
 // enrollment, not a failure.
 pub async fn find_newly_stale_agents(pool: &DbPool, threshold_minutes: i64) -> Result<Vec<AgentRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, hostname, last_seen FROM agents
+        "SELECT id, hostname, last_seen, telemetry_enabled FROM agents
          WHERE last_seen IS NOT NULL
            AND last_seen < (NOW() - INTERVAL ? MINUTE)
            AND stale_alert_sent = FALSE",
@@ -1072,8 +1083,25 @@ pub async fn delete_watched_path(pool: &DbPool, path_id: i32) -> Result<(), sqlx
     Ok(())
 }
 
+pub async fn get_agent_telemetry_enabled(pool: &DbPool, agent_id: i32) -> Result<bool, sqlx::Error> {
+    let row: Option<(bool,)> = sqlx::query_as("SELECT telemetry_enabled FROM agents WHERE id = ?")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(v,)| v).unwrap_or(false))
+}
+
+pub async fn set_agent_telemetry_enabled(pool: &DbPool, agent_id: i32, enabled: bool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE agents SET telemetry_enabled = ? WHERE id = ?")
+        .bind(enabled)
+        .bind(agent_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn get_all_agents(pool: &DbPool) -> Result<Vec<AgentRow>, sqlx::Error> {
-    sqlx::query_as("SELECT id, hostname, last_seen FROM agents")
+    sqlx::query_as("SELECT id, hostname, last_seen, telemetry_enabled FROM agents")
         .fetch_all(pool)
         .await
 }
@@ -2130,6 +2158,191 @@ pub async fn correlation_rule_hits(pool: &DbPool, rule: &CorrelationRuleRow) -> 
         .await
 }
 
+// --- Telemetry rules (threshold detection over telemetry_events) ---
+//
+// Same shape and same 60s sweep as correlation_rules above, but over the
+// eBPF sensor's structured event table instead of [Label]-prefixed
+// logs.message rows -- a deliberate second table, not a generalized
+// correlation_rules. match_label there is a single fixed-vocabulary
+// string (parser::known_labels()); telemetry needs "which event kind"
+// plus an optional filter on a *different* field depending on that kind
+// (an exe substring for process_exec, a destination port for
+// network_connect). Overloading correlation_rules' one match_label
+// column to mean two unrelated things depending on some other column
+// would be worse than a second table with its own, honestly-typed shape.
+//
+// group_by is always "host" here (v1) -- telemetry_events has no login
+// username the way logs.user does, just a numeric uid, so there's no
+// clean equivalent to correlation_rules' "per user" option yet.
+
+pub async fn init_telemetry_rules_schema(pool: &DbPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS telemetry_rules (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            kind VARCHAR(20) NOT NULL,
+            match_field VARCHAR(20) NULL,
+            match_value VARCHAR(255) NULL,
+            threshold_count INT NOT NULL,
+            window_minutes INT NOT NULL,
+            alert_severity VARCHAR(10) NOT NULL DEFAULT 'High',
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_name (name)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow, serde::Serialize)]
+pub struct TelemetryRuleRow {
+    pub id: i32,
+    pub name: String,
+    pub kind: String,
+    pub match_field: Option<String>,
+    pub match_value: Option<String>,
+    pub threshold_count: i64,
+    pub window_minutes: i64,
+    pub alert_severity: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn list_telemetry_rules(pool: &DbPool) -> Result<Vec<TelemetryRuleRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, name, kind, match_field, match_value, threshold_count, window_minutes, \
+                alert_severity, enabled, created_at FROM telemetry_rules ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_telemetry_rule(
+    pool: &DbPool,
+    name: &str,
+    kind: &str,
+    match_field: Option<&str>,
+    match_value: Option<&str>,
+    threshold_count: i64,
+    window_minutes: i64,
+    alert_severity: &str,
+) -> Result<i32, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO telemetry_rules (name, kind, match_field, match_value, threshold_count, window_minutes, alert_severity)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(name)
+    .bind(kind)
+    .bind(match_field)
+    .bind(match_value)
+    .bind(threshold_count)
+    .bind(window_minutes)
+    .bind(alert_severity)
+    .execute(pool)
+    .await?;
+    Ok(result.last_insert_id() as i32)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_telemetry_rule(
+    pool: &DbPool,
+    id: i32,
+    name: &str,
+    kind: &str,
+    match_field: Option<&str>,
+    match_value: Option<&str>,
+    threshold_count: i64,
+    window_minutes: i64,
+    alert_severity: &str,
+    enabled: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE telemetry_rules
+         SET name = ?, kind = ?, match_field = ?, match_value = ?, threshold_count = ?,
+             window_minutes = ?, alert_severity = ?, enabled = ?
+         WHERE id = ?",
+    )
+    .bind(name)
+    .bind(kind)
+    .bind(match_field)
+    .bind(match_value)
+    .bind(threshold_count)
+    .bind(window_minutes)
+    .bind(alert_severity)
+    .bind(enabled)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_telemetry_rule(pool: &DbPool, id: i32) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM telemetry_rules WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// match_field is validated to exactly "exe" | "dst_port" | None at the
+// handler layer (validate_telemetry_rule in main.rs) before a rule is
+// ever stored, so branching on it here to pick the actual WHERE clause --
+// rather than one dynamic clause trying to cover every case with
+// placeholders -- is safe, same reasoning as correlation_rule_hits'
+// `column` branch above. Reuses CorrelationHit: the output shape (a
+// group value + a count) is identical, only the query differs.
+pub async fn telemetry_rule_hits(pool: &DbPool, rule: &TelemetryRuleRow) -> Result<Vec<CorrelationHit>, sqlx::Error> {
+    match rule.match_field.as_deref() {
+        Some("exe") => {
+            sqlx::query_as(
+                "SELECT host AS group_value, COUNT(*) AS count FROM telemetry_events \
+                 WHERE kind = ? AND exe LIKE CONCAT('%', ?, '%') AND created_at > (NOW() - INTERVAL ? MINUTE) \
+                 GROUP BY host HAVING COUNT(*) >= ?",
+            )
+            .bind(&rule.kind)
+            .bind(rule.match_value.as_deref().unwrap_or(""))
+            .bind(rule.window_minutes)
+            .bind(rule.threshold_count)
+            .fetch_all(pool)
+            .await
+        }
+        Some("dst_port") => {
+            // Invalid/missing match_value can't happen past
+            // validate_telemetry_rule, but -1 (never a real port) is a
+            // safe fallback rather than silently matching every port if
+            // that invariant is ever violated some other way (a direct
+            // DB edit, a future migration).
+            let port: i32 = rule.match_value.as_deref().and_then(|v| v.parse().ok()).unwrap_or(-1);
+            sqlx::query_as(
+                "SELECT host AS group_value, COUNT(*) AS count FROM telemetry_events \
+                 WHERE kind = ? AND dst_port = ? AND created_at > (NOW() - INTERVAL ? MINUTE) \
+                 GROUP BY host HAVING COUNT(*) >= ?",
+            )
+            .bind(&rule.kind)
+            .bind(port)
+            .bind(rule.window_minutes)
+            .bind(rule.threshold_count)
+            .fetch_all(pool)
+            .await
+        }
+        _ => {
+            sqlx::query_as(
+                "SELECT host AS group_value, COUNT(*) AS count FROM telemetry_events \
+                 WHERE kind = ? AND created_at > (NOW() - INTERVAL ? MINUTE) \
+                 GROUP BY host HAVING COUNT(*) >= ?",
+            )
+            .bind(&rule.kind)
+            .bind(rule.window_minutes)
+            .bind(rule.threshold_count)
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
 // --- Syslog receiver ---
 // See src/syslog.rs for the listeners themselves and the security
 // posture (fail-closed CIDR allowlist) this config backs.
@@ -2403,4 +2616,184 @@ pub async fn select_logs_beyond_row_cap(pool: &DbPool, max_rows: i64) -> Result<
     .bind(max_rows)
     .fetch_all(pool)
     .await
+}
+
+// --- Real-time endpoint telemetry (Linux eBPF process-exec + network-connect) ---
+//
+// A separate table from `logs`, not a repurposed one: telemetry rows are
+// structured (pid/uid/exe/argv, or a connection 5-tuple), not a single
+// free-text message, and arrive batched from POST /telemetry/batch rather
+// than one row per HTTP request -- see seclog-ebpf-common's module doc
+// comment and ebpf_linux.rs on the shipper side for how an event gets here.
+// `argv_json` following the same "arbitrary structured value as a JSON
+// string column" shape already used for notification_channels.config.
+pub async fn init_telemetry_schema(pool: &DbPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS telemetry_events (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            host VARCHAR(255) NOT NULL,
+            kind VARCHAR(20) NOT NULL,
+            pid BIGINT NOT NULL,
+            uid BIGINT NOT NULL,
+            exe VARCHAR(1024) NULL,
+            argv_json TEXT NULL,
+            src_ip VARCHAR(45) NULL,
+            src_port INT NULL,
+            dst_ip VARCHAR(45) NULL,
+            dst_port INT NULL,
+            protocol VARCHAR(10) NULL,
+            event_hash CHAR(64) NOT NULL,
+            event_time TIMESTAMP NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_event (event_hash)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Backs both the per-host paginated view (GET /telemetry) and the
+    // retention sweep's age-based delete -- same two-column shape as
+    // idx_logs_host, for the same reason (without it both scale with total
+    // table size instead of one host's slice).
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_telemetry_host_created ON telemetry_events (host, created_at)")
+        .execute(pool)
+        .await
+        .ok(); // MariaDB lacks IF NOT EXISTS for indexes on some versions; ignore "already exists"
+
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow, serde::Serialize)]
+pub struct TelemetryRow {
+    pub id: i64,
+    pub host: String,
+    pub kind: String,
+    pub pid: i64,
+    pub uid: i64,
+    pub exe: Option<String>,
+    pub argv_json: Option<String>,
+    pub src_ip: Option<String>,
+    pub src_port: Option<i32>,
+    pub dst_ip: Option<String>,
+    pub dst_port: Option<i32>,
+    pub protocol: Option<String>,
+    pub event_time: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+fn telemetry_event_hash(host: &str, event: &NewTelemetryEvent, argv_json: Option<&str>) -> String {
+    let combined = format!(
+        "{}{}{}{}{}{}{}{}{}{}{}",
+        event.kind,
+        host,
+        event.pid,
+        event.uid,
+        event.exe.as_deref().unwrap_or(""),
+        argv_json.unwrap_or(""),
+        event.src_ip.as_deref().unwrap_or(""),
+        event.src_port.map(|p| p.to_string()).unwrap_or_default(),
+        event.dst_ip.as_deref().unwrap_or(""),
+        event.dst_port.map(|p| p.to_string()).unwrap_or_default(),
+        event.protocol.as_deref().unwrap_or(""),
+    );
+    parser::hash_line(&combined)
+}
+
+// Bulk INSERT IGNORE, not one query per event -- a batch from one shipper
+// poll cycle can be dozens to hundreds of process-exec events, and this is
+// the hot path for a feature that's explicitly about not falling behind
+// real-time. event_hash + INSERT IGNORE gives the same retry-safety
+// insert_log already has: a shipper retrying a batch after a dropped
+// response never double-inserts. Chunked at 200 rows/query so one
+// oversized batch can't build an unbounded query string.
+pub async fn insert_telemetry_batch(pool: &DbPool, host: &str, events: &[NewTelemetryEvent]) -> Result<u64, sqlx::Error> {
+    let mut inserted = 0u64;
+    for chunk in events.chunks(200) {
+        let mut qb: QueryBuilder<sqlx::MySql> = QueryBuilder::new(
+            "INSERT IGNORE INTO telemetry_events \
+             (host, kind, pid, uid, exe, argv_json, src_ip, src_port, dst_ip, dst_port, protocol, event_hash, event_time) ",
+        );
+        qb.push_values(chunk, |mut b, event| {
+            let argv_json = event.argv.as_ref().and_then(|a| serde_json::to_string(a).ok());
+            let hash = telemetry_event_hash(host, event, argv_json.as_deref());
+            b.push_bind(host)
+                .push_bind(&event.kind)
+                .push_bind(event.pid)
+                .push_bind(event.uid)
+                .push_bind(&event.exe)
+                .push_bind(argv_json)
+                .push_bind(&event.src_ip)
+                .push_bind(event.src_port)
+                .push_bind(&event.dst_ip)
+                .push_bind(event.dst_port)
+                .push_bind(&event.protocol)
+                .push_bind(hash)
+                .push_bind(event.event_time);
+        });
+        let result = qb.build().execute(pool).await?;
+        inserted += result.rows_affected();
+    }
+    Ok(inserted)
+}
+
+// Mirrors get_logs_for_host/count_logs_for_host's shape (AuditAccess-gated
+// on the handler side, same clamp(1, 500) limit -- see list_logs's comment
+// on why that cap exists).
+pub async fn get_telemetry_events(
+    pool: &DbPool,
+    host: &str,
+    kind: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<TelemetryRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, host, kind, pid, uid, exe, argv_json, src_ip, src_port, dst_ip, dst_port,
+                protocol, event_time, created_at
+         FROM telemetry_events
+         WHERE host = ? AND (? IS NULL OR kind = ?)
+         ORDER BY id DESC
+         LIMIT ? OFFSET ?",
+    )
+    .bind(host)
+    .bind(kind)
+    .bind(kind)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn count_telemetry_events(pool: &DbPool, host: &str, kind: Option<&str>) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM telemetry_events WHERE host = ? AND (? IS NULL OR kind = ?)",
+    )
+    .bind(host)
+    .bind(kind)
+    .bind(kind)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+// Age-based retention, mirroring delete_logs_older_than exactly -- reuses
+// the same `log_retention_days` Settings value rather than introducing a
+// second retention window, since there's no product reason yet for
+// telemetry to be kept longer or shorter than the log stream it
+// complements. Called from the same 15-minute retention loop in main().
+//
+// Deliberately NOT mirrored: enforce_max_log_rows's row-cap backstop, or
+// archive.rs's archive-before-delete path. Telemetry volume is a
+// different order of magnitude from `logs` (see ARCHITECTURE.md's
+// telemetry section) -- bolting it onto max_log_rows/the existing archive
+// config would either cap it far too aggressively or silently borrow a
+// budget meant for `logs`. A real row-cap/archive story for this table is
+// a follow-on decision, not something to improvise here; age-based
+// cleanup alone is enough to stop the table from growing forever, which
+// is the actual gap this closes.
+pub async fn delete_telemetry_older_than(pool: &DbPool, days: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM telemetry_events WHERE created_at < (NOW() - INTERVAL ? DAY)")
+        .bind(days)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }

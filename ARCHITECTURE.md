@@ -197,6 +197,29 @@ wire it happens on.
   calls `notify::trigger_alert`, the same "system alert only, no
   separate history table" pattern already used for staleness/capacity/
   checkpoint-failure.
+- **Telemetry rules** — the same threshold-detection shape as Correlation
+  rules above, but over `telemetry_events` (the Linux eBPF sensor's
+  structured data, see "Endpoint telemetry" below) instead of
+  `[Label]`-prefixed `logs` rows. A deliberate second table
+  (`telemetry_rules`) and query function (`db::telemetry_rule_hits`)
+  rather than generalizing `correlation_rules`: that table's one
+  `match_label` column is a single fixed-vocabulary string, but a
+  telemetry rule needs "which event kind" (`process_exec` |
+  `network_connect`) plus an optional filter on a *different* field
+  depending on that kind (an `exe` substring for `process_exec`, a
+  `dst_port` for `network_connect`) — overloading `match_label` to carry
+  two unrelated meanings would be worse than a second, honestly-typed
+  table. `group_by` is always `host` here (v1): `telemetry_events` has no
+  login username the way `logs.user` does, just a numeric `uid`, so
+  there's no clean equivalent to Correlation rules' "per user" option
+  yet. Runs in the *same* 60s loop/task as the correlation-rule sweep
+  (one fewer background task, nothing gained from a separate timer) with
+  its own `HashMap<rule_id, HashSet<group_value>>` dedup — kept separate
+  from the correlation sweep's map since `telemetry_rules.id` and
+  `correlation_rules.id` are unrelated integer spaces from different
+  tables and could otherwise collide. Closes the gap the "Endpoint
+  telemetry" section below used to call out explicitly: before this,
+  `telemetry_events` had zero detection reading it at all.
 - **Syslog receiver** (`src/syslog.rs`) — a UDP and/or TCP listener on
   514, bound once at startup if enabled (`syslog_config`, read like
   `DATABASE_URL`: an infra-level socket bind, not a live setting — see
@@ -239,7 +262,7 @@ wire it happens on.
   consumers: LDAP bind password, S3 secret key, SFTP password/private
   key).
 
-## Shipper (`src/bin/shipper.rs`)
+## Shipper (`src/bin/shipper/main.rs`)
 
 Single binary, no config file — everything comes from two environment
 variables (`SHIPPER_API_URL`, `SECLOG_ENROLLMENT_TOKEN`) and state it
@@ -340,6 +363,179 @@ time, logging or alerting on large skew (see AU-5 above).
 `logs.line_hash` unique constraint — `db::insert_log` uses `INSERT
 IGNORE`, so a shipper retry after a dropped response never creates a
 duplicate row.
+
+## Endpoint telemetry (Linux eBPF: `seclog-ebpf`, `seclog-ebpf-common`, `src/bin/shipper/ebpf_linux.rs`)
+
+Everything above this section is log-line tailing: reactive text parsing of
+files/commands that already exist. This is different in kind, not degree —
+a kernel-level sensor with no text log in the loop at all, giving direct
+visibility into process-exec and outbound-network-connect activity a text
+log might never capture. It's a separate workspace (`seclog-ebpf-common`,
+`seclog-ebpf` as members alongside the root `seclog` package) and an
+off-by-default Cargo feature (`telemetry`) — building it needs the
+`bpfel-unknown-none` target, a nightly toolchain (`-Z build-std=core`), and
+`bpf-linker` (itself needing LLVM; the project's own prebuilt
+`x86_64-unknown-linux-gnu`-musl release binary avoids needing LLVM dev
+packages on the build host — see `.github/workflows/release.yml`), none of
+which the server or a plain log-shipping shipper should ever need. A
+normal `cargo build`/`cargo build --release` (what `Dockerfile` and a
+default shipper build both do) never touches these crates at all;
+`cargo build --bin shipper --features telemetry` does.
+
+- **`seclog-ebpf-common`** — a `#![no_std]`, dependency-free crate holding
+  one `#[repr(C)]` `TelemetryEvent` struct, compiled unmodified by both the
+  kernel-side eBPF programs and the userspace poller, so the ring-buffer
+  bytes one side writes and the other reads are guaranteed to agree with no
+  separate wire format for this hop. One flat struct for both event kinds
+  (kind-specific fields left zeroed when not applicable), same shape as
+  `NewLogEntry`/`LdapConfigRequest` elsewhere in this codebase.
+- **`seclog-ebpf`** — four tracepoint programs sharing one `RingBuf` map:
+  - `process_exec` hooks `syscalls:sys_enter_execve` (not
+    `sched:sched_process_exec`) specifically so `filename`/`argv` come from
+    stable, fixed-offset tracepoint fields instead of needing a generated
+    `task_struct`/`mm_struct` CO-RE binding just to walk
+    `current->mm->arg_start/arg_end` — one fewer moving part, at the cost
+    of a bounded (`MAX_ARGS = 8`) argv capture. Parent pid is deliberately
+    **not** captured in-kernel for the same reason (would need that same
+    `task_struct` binding); v1 has no ppid field anywhere in the pipeline.
+  - `network_connect` hooks `sock:inet_sock_set_state`, filtering
+    `oldstate == SYN_SENT && newstate == ESTABLISHED` — new *outbound* TCP
+    connections only (the accept-side transition is `SYN_RECV ->
+    ESTABLISHED` instead). UDP and inbound connections are out of scope.
+  - `file_write` hooks `syscalls:sys_enter_openat`, filtered in-kernel to
+    write-intent opens (`O_WRONLY|O_RDWR|O_CREAT|O_TRUNC`) against a
+    small hardcoded list (`WATCHED_FILES`) of commonly security-relevant
+    absolute paths (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, etc.) —
+    file-integrity monitoring, v1. Deliberately **not** an
+    admin-configurable watchlist synced from the server: that needs a
+    second BPF map, a userspace→kernel sync path on every config poll,
+    and exact byte-for-byte path-encoding agreement between the two
+    sides — real surface that deserves its own pass, not something to
+    fold into "add file events." Matching is exact-string only (the
+    literal `openat()` path argument, not a canonicalized/resolved one)
+    — opening a watched file via a relative path, a different absolute
+    alias, or a symlink won't match. Covers `open()` too (glibc's
+    `open()` compiles down to the `openat` syscall on every mainstream
+    64-bit target) but not `openat2()` (a distinct syscall, only reached
+    via that specific libc call).
+  - `module_load` hooks `module:module_load`, which fires once a module
+    has *finished* loading (not at `init_module`/`finit_module` syscall
+    *entry*, unlike every other program here — neither syscall carries a
+    module name at entry: `init_module(2)` takes a raw ELF image,
+    `finit_module(2)` only a file descriptor, so the name isn't known
+    until the kernel has parsed it). Its module-name field is a
+    `__string()`/`__data_loc` field rather than a plain fixed-offset one
+    — still part of the tracepoint's own stable, append-only record
+    format, just needing one extra decode step: the raw `u32` is
+    `(offset << 16 | length)` relative to the record's own start,
+    verified against the exact kernel macros that decode it
+    (`include/trace/stages/stage3_trace_output.h`'s
+    `__get_dynamic_array`/`__get_str`), not guessed.
+  - `file_write` and `module_load` both reuse `TelemetryEvent`'s
+    `exe`/`exe_len` fields for their one string payload (the watched
+    path, or the module name) rather than growing the struct with
+    kind-specific fields nothing else needs — same "flat struct,
+    unused-for-this-kind fields left alone" spirit the struct's own doc
+    comment already describes for `process_exec`.
+  - `TelemetryEvent` (~850 bytes) is far too large for the ~512-byte BPF
+    stack frame limit — building one as a stack local fails the verifier
+    immediately (`Looks like the BPF stack limit is exceeded`, hit and
+    fixed while building this). Both programs build the event in a
+    single-slot `PerCpuArray` scratch map instead (`DATA_HEAP`), which
+    means every field read back out (`exe_len`, `args_len` especially)
+    must be explicitly reset on every call path, since a per-CPU map slot
+    persists stale values from whichever call last used it — there's no
+    fresh zeroed stack frame to fall back on.
+  - CO-RE (Compile Once – Run Everywhere) is what makes one compiled
+    program portable across kernel versions: relocations resolve against
+    `/sys/kernel/btf/vmlinux` at *load* time on the target host, not build
+    time. No BTF (kernels older than roughly 5.8, or BTF-stripped builds)
+    means `ebpf_linux::run` logs a warning and returns without loading
+    anything — telemetry is additive, so a host that can't run the sensor
+    must fall through to normal operation, not take the shipper down.
+- **`src/bin/shipper/ebpf_linux.rs`** — loads the bytecode (embedded via
+  `include_bytes_aligned!` from `OUT_DIR`, produced by `build.rs` calling
+  `aya_build::build_ebpf` — the same cargo-in-cargo pattern the upstream
+  `aya-template` uses, since Cargo itself can't `-Z build-std` a regular
+  dependency), attaches both tracepoints, and polls the ring buffer via a
+  tokio `AsyncFd`. Converts `bpf_ktime_get_boot_ns` timestamps
+  (`CLOCK_BOOTTIME`, not wall-clock) to UTC by diffing against
+  `clock_gettime(CLOCK_BOOTTIME)` read at conversion time. Batches events
+  (2s timer or 100 events, whichever first) into `POST /telemetry/batch` —
+  unlike the file-tailing watchers, there's no persisted read-position to
+  hold back on failure, so a batch that exhausts its 3 retries is dropped,
+  not requeued; telemetry here is best-effort additive intelligence, not
+  an audit-grade record the way `logs` is.
+  `main.rs`'s config-reconciliation loop starts/stops this exactly like a
+  per-path file watcher (`tokio::spawn`/`.abort()`), just one
+  `Option<JoinHandle>` instead of a `HashMap` since there's only one sensor
+  per host — driven by `AgentConfigResponse.telemetry_enabled`, a per-agent
+  opt-in (`agents.telemetry_enabled`, off by default) toggled from the
+  Agents page (`POST /agents/{id}/telemetry`). Attaches and polls all
+  four tracepoints above through this same path.
+
+Server side: `telemetry_events` (`db::init_telemetry_schema`) is a
+separate table from `logs`, not a repurposed one — rows are structured
+(pid/uid/exe/argv, or a connection 5-tuple) rather than one free-text
+message, with `argv` stored as a JSON string column (same "arbitrary
+structured value as a JSON string" shape as
+`notification_channels.config`). `POST /telemetry/batch`
+(`AgentAuth`-gated like `POST /logs`) bulk-inserts via `sqlx::QueryBuilder`
+multi-row `INSERT IGNORE` rather than one query per event — a real batch
+can be dozens to hundreds of rows, and this is deliberately the hot path
+for a feature about not falling behind real-time. `event_hash` (content
+hash, same role as `logs.line_hash`) gives the same retry-safety
+`insert_log` already has. `GET /telemetry` is `AuditAccess`-gated with the
+same pagination shape and `limit.clamp(1, 500)` cap as `list_logs`, for
+the same reason (see the 600k-row DOM-crash comment on `list_logs`).
+Threshold detection over this table now exists too — see "Telemetry
+rules" above — but it's opt-in per rule and off by default (no seeded
+defaults, unlike Correlation rules' three); the Telemetry page itself
+stays a raw event stream regardless, for pivoting into the underlying
+events once a rule alerts.
+`telemetry_events` shares `logs`' age-based retention window
+(`db::delete_telemetry_older_than`, same `log_retention_days` Settings
+value, called from the same 15-minute retention loop) so turning the
+sensor on doesn't grow an unbounded table — but deliberately has no
+row-cap backstop or archival integration yet (see that function's own
+comment for why bolting it onto `max_log_rows`/the existing archive
+config isn't the right move): telemetry volume is a different order of
+magnitude from `logs`, and a real row-cap/archive story for it is a
+follow-on decision, not one to improvise inside this feature.
+
+### Auditd telemetry fallback (hosts without BTF)
+
+For a kernel the eBPF sensor can't run on at all (older than roughly
+5.8, or a BTF-stripped build — the same check `ebpf_linux::run` already
+does against `/sys/kernel/btf/vmlinux`), there's no structured
+`telemetry_events` equivalent. What exists instead reuses 100% existing
+architecture, deliberately: four new `parser::rules()` entries
+(`src/parser.rs`) matching `type=SYSCALL` lines from the Linux audit
+subsystem tagged with one of four specific recommended `auditctl` `-k`
+keys (`seclog_exec`, `seclog_connect`, `seclog_open`, `seclog_module`) —
+see the "Auditd telemetry fallback" comment right above those rules for
+the exact recommended rule set. Matching on an admin-chosen key string
+rather than a numeric syscall ID sidesteps syscall numbers being
+architecture-dependent (execve is 59 on x86_64, 221 on arm64); it works
+identically whether the key came from a `-S execve`-style syscall rule
+or a `-w /path -p wa`-style file watch, since auditd attaches the key
+the same way either way.
+
+This is a real but deliberately lower-fidelity substitute, not a second
+implementation of the sensor: each matching line becomes one ordinary
+classified `logs` row via the *existing* text-tailing path (the operator
+adds `/var/log/audit/audit.log` as a watched path on the Agents page,
+exactly like any other log file) — no argv/exe/dst_port extraction, no
+`telemetry_events` row, and critically, **not** visible to Telemetry
+Rules (which only ever read `telemetry_events`). Correlation Rules (which
+read `[Label]`-prefixed `logs` rows) can threshold on these four new
+labels exactly like any other detection — `known_labels()`/`classify()`
+both derive from the same `rules()` table, so no separate wiring was
+needed for them to show up in the Correlation Rules label picker. The
+shipper's telemetry task prints the exact recommended `auditctl` rules
+to stderr the moment it detects it can't load the real sensor (see
+`ebpf_linux::run`), rather than requiring the operator to already know
+to look here.
 
 ## Data flow, end to end
 

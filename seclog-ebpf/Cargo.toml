@@ -1,0 +1,13 @@
+[package]
+name = "seclog-ebpf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seclog-ebpf-common = { path = "../seclog-ebpf-common" }
+aya-ebpf = { version = "0.2.1", default-features = false }
+aya-log-ebpf = { version = "0.2.0", default-features = false }
+
+[[bin]]
+name = "seclog-ebpf"
+path = "src/main.rs"

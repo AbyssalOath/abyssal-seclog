@@ -3,6 +3,27 @@ name = "seclog"
 version = "0.2.0"
 edition = "2024"
 
+[workspace]
+# The eBPF programs are their own workspace members, not path dependencies of
+# `seclog` compiled the normal way: `seclog-ebpf` targets `bpfel-unknown-none`
+# and needs `-Z build-std`, which regular `cargo build` can't do for a
+# dependency. `build.rs` (feature-gated behind `telemetry`, see below) shells
+# out to build it separately, the same way the upstream aya-template does --
+# see the comment on the `seclog-ebpf` path dependency below.
+members = ["seclog-ebpf-common", "seclog-ebpf"]
+
+[profile.release.package.seclog-ebpf]
+debug = 2
+codegen-units = 1
+strip = false
+
+# Unoptimized eBPF bytecode routinely fails the kernel verifier (too many
+# instructions/branches for it to prove termination/safety on), so even a
+# debug build of this one package needs -O -- doesn't affect anything else
+# in the workspace.
+[profile.dev.package.seclog-ebpf]
+opt-level = 3
+
 [dependencies]
 aes-gcm = "0.11.1"
 argon2 = "0.5.3"
@@ -38,3 +59,35 @@ tokio = { version = "1.53.1", features = ["full"] }
 totp-rs = { version = "5.7", features = ["gen_secret", "otpauth"] }
 tower-http = { version = "0.7.0", features = ["cors", "fs", "set-header"] }
 url = "2"
+
+# Real-time endpoint telemetry (Linux eBPF process-exec + network-connect
+# sensor). Off by default: building it needs the bpfel-unknown-none target,
+# a nightly toolchain (for `-Z build-std=core`), and `bpf-linker`, which in
+# turn needs LLVM/clang dev libraries -- none of that should be required to
+# build the server or a plain log-shipping shipper. Build with
+# `cargo build --bin shipper --features telemetry` once that toolchain is
+# installed; see seclog-ebpf/README.md for the exact setup steps.
+aya = { version = "0.14.0", default-features = false, optional = true }
+aya-log = { version = "0.3.0", default-features = false, optional = true }
+libc = { version = "0.2.159", default-features = false, optional = true }
+# Shared #[repr(C)] event structs with seclog-ebpf (kernel side) -- plain
+# #![no_std] crate with no deps of its own, but only the shipper's telemetry
+# code (ebpf_linux.rs) actually uses it, so it's gated the same as the rest.
+seclog-ebpf-common = { path = "seclog-ebpf-common", optional = true }
+
+[features]
+telemetry = [
+    "dep:aya", "dep:aya-log", "dep:libc", "dep:seclog-ebpf-common",
+    "dep:anyhow", "dep:aya-build", "dep:cargo_metadata", "dep:seclog-ebpf",
+]
+
+[build-dependencies]
+anyhow = { version = "1", optional = true }
+# TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an
+# artifact dependency, but Cargo can't be told to build it with
+# `-Z build-std`. aya-build cargo-in-cargos the actual build instead -- see
+# build.rs. This entry just teaches Cargo about the dependency so build
+# cache invalidation works.
+aya-build = { version = "0.2.0", default-features = false, optional = true }
+cargo_metadata = { version = "0.23.0", default-features = false, optional = true }
+seclog-ebpf = { path = "seclog-ebpf", optional = true }

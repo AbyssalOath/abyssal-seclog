@@ -12,6 +12,14 @@ use std::sync::OnceLock;
 #[cfg(target_os = "windows")]
 use std::process::Command;
 
+// Real-time endpoint telemetry (Linux eBPF process-exec + network-connect
+// sensor) -- see ebpf_linux.rs's module doc comment. Gated behind both
+// target_os and the `telemetry` Cargo feature (off by default, see the
+// workspace Cargo.toml) so a plain `cargo build` never needs the eBPF
+// toolchain.
+#[cfg(all(target_os = "linux", feature = "telemetry"))]
+mod ebpf_linux;
+
 #[derive(Serialize)]
 struct NewLogEntry {
     severity: String,
@@ -29,6 +37,12 @@ struct NewLogEntry {
 struct AgentConfigResponse {
     hostname: String,
     paths: Vec<String>,
+    // Per-agent opt-in for the eBPF telemetry sensor, set from the Agents
+    // page. #[serde(default)] so an older server (pre-telemetry) response
+    // still deserializes -- absent means false, same as the column's own
+    // DB default.
+    #[serde(default)]
+    telemetry_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -60,13 +74,13 @@ fn save_key(key: &str) {
     }
 }
 
-// Every reqwest::Client in this file should come from here. The default
-// client has no timeout at all, so a connection that stalls without ever
-// closing (a dead NAT mapping, a proxy that swallows the response) would
-// hang a watch loop indefinitely -- the retry logic in ship_line never
-// even gets a chance to run since the single attempt in flight never
-// returns.
-fn new_http_client() -> reqwest::Client {
+// Every reqwest::Client in this file (and in ebpf_linux.rs) should come
+// from here. The default client has no timeout at all, so a connection
+// that stalls without ever closing (a dead NAT mapping, a proxy that
+// swallows the response) would hang a watch loop indefinitely -- the retry
+// logic in ship_line never even gets a chance to run since the single
+// attempt in flight never returns.
+pub(crate) fn new_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -471,6 +485,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // as the server's config changes, without restarting everything.
     let mut active: HashMap<String, JoinHandle<()>> = HashMap::new();
 
+    // Same idea as `active` above, but for the single telemetry sensor
+    // task instead of a per-path map -- see the reconciliation loop below.
+    #[cfg(all(target_os = "linux", feature = "telemetry"))]
+    let mut telemetry_handle: Option<JoinHandle<()>> = None;
+
     // Fetch our registered hostname once at startup -- this is what gets
     // attached to every log line we ship, rather than trusting a locally
     // guessed value.
@@ -519,6 +538,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(response) if response.status().is_success() => {
                 match response.json::<AgentConfigResponse>().await {
                     Ok(config) => {
+                        // Telemetry reconciliation -- same "spawn on grant,
+                        // abort on revoke" shape as the per-path loop below,
+                        // just a single Option<JoinHandle> instead of a map
+                        // since there's only ever one sensor per host, not
+                        // one per path. Read config.telemetry_enabled before
+                        // config.paths is moved out of below (partial move
+                        // of a Copy field is fine either way, but doing it
+                        // up top keeps this block self-contained).
+                        #[cfg(all(target_os = "linux", feature = "telemetry"))]
+                        {
+                            if config.telemetry_enabled && telemetry_handle.is_none() {
+                                let base = base_url.clone();
+                                let key = api_key.clone();
+                                let host = hostname.clone();
+                                telemetry_handle = Some(tokio::spawn(async move {
+                                    ebpf_linux::run(base, key, host).await;
+                                }));
+                                println!("Telemetry enabled by server config -- starting eBPF sensor");
+                            } else if !config.telemetry_enabled
+                                && let Some(handle) = telemetry_handle.take()
+                            {
+                                handle.abort();
+                                println!("Telemetry disabled by server config -- eBPF sensor stopped");
+                            }
+                        }
+                        #[cfg(not(all(target_os = "linux", feature = "telemetry")))]
+                        {
+                            // No sensor available on this platform/build --
+                            // the flag is still delivered by the server, we
+                            // just have nothing to do with it here.
+                            let _ = config.telemetry_enabled;
+                        }
+
                         let desired: HashSet<String> = config.paths.into_iter().collect();
 
                         // Stop watching anything no longer in the desired set.

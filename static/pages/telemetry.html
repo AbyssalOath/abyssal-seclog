@@ -1,0 +1,42 @@
+<h1>Telemetry</h1>
+<div id="telemetry-access-result"></div>
+
+<div id="telemetry-content" style="display:none;">
+    <div class="panel">
+        <h2>Endpoint Telemetry</h2>
+        <div class="panel-desc">
+            Real-time process-exec and network-connect events from the Linux eBPF sensor, for hosts
+            where it's been turned on (per-agent toggle on the Agents page). Raw event stream only --
+            there's no detection/scoring layered on this data yet.
+        </div>
+
+        <label for="telemetry-host-select">Host:</label>
+        <select id="telemetry-host-select" onchange="onTelemetryHostChange()"></select>
+        <label for="telemetry-kind-filter">Kind:</label>
+        <select id="telemetry-kind-filter" onchange="loadTelemetryPage()">
+            <option value="">All kinds</option>
+            <option value="process_exec">Process exec</option>
+            <option value="network_connect">Network connect</option>
+            <option value="file_write">File write (FIM)</option>
+            <option value="module_load">Kernel module load</option>
+        </select>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Kind</th>
+                    <th>PID</th>
+                    <th>UID</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody id="telemetry-rows"></tbody>
+        </table>
+        <div class="pagination-row">
+            <button id="telemetry-prev" onclick="changeTelemetryPage(-1)">&laquo; Prev</button>
+            <span id="telemetry-page-info"></span>
+            <button id="telemetry-next" onclick="changeTelemetryPage(1)">Next &raquo;</button>
+        </div>
+    </div>
+</div>

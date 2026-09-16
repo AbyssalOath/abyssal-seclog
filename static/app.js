@@ -382,6 +382,14 @@ async function loadAgents() {
         const seenCell = document.createElement('td');
         seenCell.textContent = agent.last_seen ? agent.last_seen : 'Never';
 
+        const telemetryCell = document.createElement('td');
+        const telemetryCheckbox = document.createElement('input');
+        telemetryCheckbox.type = 'checkbox';
+        telemetryCheckbox.checked = agent.telemetry_enabled;
+        telemetryCheckbox.title = 'Real-time process/network sensor -- needs a Linux shipper built with --features telemetry';
+        telemetryCheckbox.onchange = () => toggleAgentTelemetry(agent.id, telemetryCheckbox.checked);
+        telemetryCell.appendChild(telemetryCheckbox);
+
         const manageCell = document.createElement('td');
         const manageBtn = document.createElement('button');
         manageBtn.textContent = 'Manage Paths';
@@ -397,10 +405,19 @@ async function loadAgents() {
         row.appendChild(idCell);
         row.appendChild(hostCell);
         row.appendChild(seenCell);
+        row.appendChild(telemetryCell);
         row.appendChild(manageCell);
         row.appendChild(deleteCell);
         tbody.appendChild(row);
     }
+}
+
+async function toggleAgentTelemetry(agentId, enabled) {
+    await authFetch(`/agents/${agentId}/telemetry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+    });
 }
 
 async function deleteAgent(agentId, hostname) {
@@ -1006,6 +1023,8 @@ function showTab(tab) {
     	renderChannelFields();
     	loadCorrelationLabels();
     	loadCorrelationRules();
+    	onTelemetryRuleKindChange();
+    	loadTelemetryRules();
     }
 
     if (tab === 'directory') {
@@ -1469,6 +1488,125 @@ async function changeAuditLogPage(delta) {
     await loadAuditLog();
 }
 
+// ---------- Telemetry ----------
+// Same "server paginates, browser just renders one page" shape as the
+// dashboard's per-host log view and the audit log above -- see those for
+// why (600k+ row DOM crash precedent). Host list is borrowed from
+// /logs/summary rather than a new endpoint, since every host with any
+// event history (log or telemetry) already shows up there.
+const TELEMETRY_PAGE_SIZE = 25;
+let telemetryPage = 0;
+let telemetryTotal = 0;
+
+// Shared between the raw event table below and the Telemetry Rules panel
+// (Settings -> Alerts) -- one place naming the four event kinds.
+const TELEMETRY_KIND_LABELS = {
+    process_exec: 'Process exec',
+    network_connect: 'Network connect',
+    file_write: 'File write (FIM)',
+    module_load: 'Kernel module load',
+};
+
+async function initTelemetryPage() {
+    const meResp = await authFetch('/me');
+    if (!meResp.ok) return;
+    const me = await meResp.json();
+
+    if (me.role !== 'admin' && me.role !== 'auditor') {
+        document.getElementById('telemetry-access-result').innerText = 'Access denied: admin or auditor only.';
+        return;
+    }
+    document.getElementById('telemetry-content').style.display = 'block';
+
+    const response = await authFetch('/logs/summary');
+    const hosts = response.ok ? await response.json() : [];
+    const select = document.getElementById('telemetry-host-select');
+    select.innerHTML = '';
+    for (const h of hosts) {
+        const option = document.createElement('option');
+        option.value = h.host;
+        option.textContent = h.host;
+        select.appendChild(option);
+    }
+
+    telemetryPage = 0;
+    if (hosts.length > 0) loadTelemetryPage();
+}
+
+function onTelemetryHostChange() {
+    telemetryPage = 0;
+    loadTelemetryPage();
+}
+
+function formatTelemetryDetails(event) {
+    if (event.kind === 'process_exec') {
+        let argv = [];
+        if (event.argv_json) {
+            try { argv = JSON.parse(event.argv_json); } catch (e) { argv = []; }
+        }
+        return [event.exe || '(unknown)'].concat(argv).join(' ');
+    }
+    if (event.kind === 'file_write') {
+        return event.exe || '(unknown path)';
+    }
+    if (event.kind === 'module_load') {
+        return event.exe || '(unknown module)';
+    }
+    const src = `${event.src_ip || '?'}:${event.src_port ?? '?'}`;
+    const dst = `${event.dst_ip || '?'}:${event.dst_port ?? '?'}`;
+    return `${src} -> ${dst} (${event.protocol || '?'})`;
+}
+
+async function loadTelemetryPage() {
+    const host = document.getElementById('telemetry-host-select').value;
+    if (!host) return;
+    const kind = document.getElementById('telemetry-kind-filter').value;
+
+    const offset = telemetryPage * TELEMETRY_PAGE_SIZE;
+    let url = `/telemetry?host=${encodeURIComponent(host)}&limit=${TELEMETRY_PAGE_SIZE}&offset=${offset}`;
+    if (kind) url += `&kind=${encodeURIComponent(kind)}`;
+
+    const response = await authFetch(url);
+    if (!response.ok) return;
+    const data = await response.json();
+    telemetryTotal = data.total;
+
+    const tbody = document.getElementById('telemetry-rows');
+    tbody.innerHTML = '';
+    for (const event of data.events) {
+        const row = document.createElement('tr');
+
+        const timeCell = document.createElement('td');
+        timeCell.textContent = formatTimestamp(event.event_time || event.created_at);
+        const kindCell = document.createElement('td');
+        kindCell.textContent = TELEMETRY_KIND_LABELS[event.kind] || event.kind;
+        const pidCell = document.createElement('td');
+        pidCell.textContent = event.pid;
+        const uidCell = document.createElement('td');
+        uidCell.textContent = event.uid;
+        const detailsCell = document.createElement('td');
+        detailsCell.textContent = formatTelemetryDetails(event);
+
+        row.appendChild(timeCell);
+        row.appendChild(kindCell);
+        row.appendChild(pidCell);
+        row.appendChild(uidCell);
+        row.appendChild(detailsCell);
+        tbody.appendChild(row);
+    }
+
+    const totalPages = Math.max(1, Math.ceil(telemetryTotal / TELEMETRY_PAGE_SIZE));
+    document.getElementById('telemetry-page-info').textContent =
+        `Page ${telemetryPage + 1} of ${totalPages} (${telemetryTotal} total)`;
+    document.getElementById('telemetry-prev').disabled = telemetryPage <= 0;
+    document.getElementById('telemetry-next').disabled = telemetryPage + 1 >= totalPages;
+}
+
+async function changeTelemetryPage(delta) {
+    telemetryPage += delta;
+    await loadTelemetryPage();
+}
+
 // ---------- MFA ----------
 // QR rendering is loaded lazily and only client-side -- the server never
 // generates an image, just the otpauth:// URL and the base32 secret; this
@@ -1711,6 +1849,131 @@ async function deleteCorrelationRule(id) {
     if (!confirm('Remove this correlation rule?')) return;
     const response = await authFetch(`/correlation-rules/${id}`, { method: 'DELETE' });
     if (response.ok) loadCorrelationRules();
+}
+
+// ---------- Telemetry Rules ----------
+// Same shape as Correlation Rules above, just against /telemetry-rules
+// and telemetry_events' kind/exe/dst_port instead of a [Label]-prefixed
+// logs.message row -- see db.rs's telemetry_rules section for why this
+// is a separate endpoint/table rather than folded into correlation rules.
+
+const TELEMETRY_RULE_MATCH_LABELS = { exe: 'exe contains', dst_port: 'dst_port =' };
+
+// "Exe contains" makes sense for process_exec/file_write/module_load
+// (all three carry a string in the same underlying `exe` field -- see
+// seclog-ebpf-common's TelemetryEvent doc comment); "dst_port equals"
+// only for network_connect. Rather than let the form submit a
+// combination the server will just reject, disable the field-specific
+// options that don't apply to the currently selected kind and fall back
+// to "Any event of this kind" if the stale selection no longer applies.
+function onTelemetryRuleKindChange() {
+    const kind = document.getElementById('tel-rule-kind').value;
+    const matchField = document.getElementById('tel-rule-match-field');
+    for (const opt of matchField.options) {
+        if (opt.value === 'exe') opt.disabled = kind === 'network_connect';
+        if (opt.value === 'dst_port') opt.disabled = kind !== 'network_connect';
+    }
+    if (matchField.selectedOptions[0]?.disabled) matchField.value = '';
+}
+
+async function loadTelemetryRules() {
+    const response = await authFetch('/telemetry-rules');
+    if (!response.ok) return;
+    const rules = await response.json();
+
+    const tbody = document.getElementById('tel-rule-rows');
+    tbody.innerHTML = '';
+
+    for (const rule of rules) {
+        const row = document.createElement('tr');
+
+        const nameCell = document.createElement('td');
+        nameCell.textContent = rule.name;
+        const kindCell = document.createElement('td');
+        kindCell.textContent = TELEMETRY_KIND_LABELS[rule.kind] || rule.kind;
+        const matchCell = document.createElement('td');
+        matchCell.textContent = rule.match_field
+            ? `${TELEMETRY_RULE_MATCH_LABELS[rule.match_field] || rule.match_field} "${rule.match_value}"`
+            : 'Any';
+        const thresholdCell = document.createElement('td');
+        thresholdCell.textContent = rule.threshold_count;
+        const windowCell = document.createElement('td');
+        windowCell.textContent = rule.window_minutes + ' min';
+        const severityCell = document.createElement('td');
+        severityCell.textContent = rule.alert_severity;
+
+        const enabledCell = document.createElement('td');
+        const enabledToggle = document.createElement('input');
+        enabledToggle.type = 'checkbox';
+        enabledToggle.checked = rule.enabled;
+        enabledToggle.onchange = () => toggleTelemetryRule(rule, enabledToggle.checked);
+        enabledCell.appendChild(enabledToggle);
+
+        const actionCell = document.createElement('td');
+        const delBtn = document.createElement('button');
+        delBtn.textContent = 'Remove';
+        delBtn.style.background = 'transparent';
+        delBtn.style.borderColor = 'var(--border)';
+        delBtn.style.color = 'var(--text-dim)';
+        delBtn.onclick = () => deleteTelemetryRule(rule.id);
+        actionCell.appendChild(delBtn);
+
+        row.append(nameCell, kindCell, matchCell, thresholdCell, windowCell, severityCell, enabledCell, actionCell);
+        tbody.appendChild(row);
+    }
+}
+
+async function createTelemetryRule() {
+    const resultEl = document.getElementById('tel-rule-result');
+    const matchField = document.getElementById('tel-rule-match-field').value;
+    const payload = {
+        name: document.getElementById('tel-rule-name').value.trim(),
+        kind: document.getElementById('tel-rule-kind').value,
+        match_field: matchField || null,
+        match_value: matchField ? document.getElementById('tel-rule-match-value').value.trim() : null,
+        threshold_count: parseInt(document.getElementById('tel-rule-threshold').value, 10),
+        window_minutes: parseInt(document.getElementById('tel-rule-window').value, 10),
+        alert_severity: document.getElementById('tel-rule-severity').value,
+        enabled: true,
+    };
+
+    if (!payload.name || !(payload.threshold_count >= 2) || !(payload.window_minutes >= 1)) {
+        resultEl.innerText = 'Name a rule, and use a threshold of at least 2 over at least 1 minute.';
+        return;
+    }
+    if (matchField && !payload.match_value) {
+        resultEl.innerText = 'Enter a value to match against, or switch back to "Any event of this kind".';
+        return;
+    }
+
+    const response = await authFetch('/telemetry-rules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+
+    if (response.ok) {
+        resultEl.innerText = '';
+        document.getElementById('tel-rule-name').value = '';
+        document.getElementById('tel-rule-match-value').value = '';
+        loadTelemetryRules();
+    } else {
+        resultEl.innerText = 'Failed to add rule: ' + response.status;
+    }
+}
+
+async function toggleTelemetryRule(rule, enabled) {
+    await authFetch(`/telemetry-rules/${rule.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...rule, enabled })
+    });
+}
+
+async function deleteTelemetryRule(id) {
+    if (!confirm('Remove this telemetry rule?')) return;
+    const response = await authFetch(`/telemetry-rules/${id}`, { method: 'DELETE' });
+    if (response.ok) loadTelemetryRules();
 }
 
 // ---------- Notifications ----------

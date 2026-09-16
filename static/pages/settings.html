@@ -251,6 +251,59 @@
             </table>
         </div>
 
+        <div class="panel">
+            <h2>Telemetry Rules</h2>
+            <div class="panel-desc">
+                Threshold detection over the Linux eBPF sensor's raw event stream (the
+                <a href="#/telemetry" onclick="event.preventDefault(); navigateTo('/telemetry')">Telemetry</a>
+                page) -- e.g. 10 process execs from one host within
+                2 minutes, or 5 connections to the same destination port within 5 minutes. Requires a
+                telemetry-capable shipper with the sensor turned on for a host (Agents page) before
+                anything here can fire.
+            </div>
+
+            <div class="inline-form">
+                <input id="tel-rule-name" placeholder="Rule name" style="width:220px;">
+                <select id="tel-rule-kind" onchange="onTelemetryRuleKindChange()">
+                    <option value="process_exec">Process exec</option>
+                    <option value="network_connect">Network connect</option>
+                    <option value="file_write">File write (FIM)</option>
+                    <option value="module_load">Kernel module load</option>
+                </select>
+                <select id="tel-rule-match-field" onchange="onTelemetryRuleKindChange()">
+                    <option value="">Any event of this kind</option>
+                    <option value="exe">Exe contains</option>
+                    <option value="dst_port">Destination port equals</option>
+                </select>
+                <input id="tel-rule-match-value" placeholder="value" style="width:140px;">
+            </div>
+            <div class="inline-form">
+                <label style="margin:0;">At least
+                    <input id="tel-rule-threshold" type="number" min="2" value="10" style="width:5rem; margin-left:0.5rem;">
+                    events within
+                    <input id="tel-rule-window" type="number" min="1" value="5" style="width:5rem; margin-left:0.5rem;"> min
+                </label>
+                <select id="tel-rule-severity">
+                    <option value="Low">Low</option>
+                    <option value="Medium">Medium</option>
+                    <option value="High" selected>High</option>
+                    <option value="Critical">Critical</option>
+                </select>
+                <button onclick="createTelemetryRule()">Add Rule</button>
+            </div>
+            <div id="tel-rule-result" class="hint"></div>
+
+            <table style="margin-top:1rem;">
+                <thead>
+                    <tr>
+                        <th>Name</th><th>Kind</th><th>Match</th><th>Threshold</th><th>Window</th>
+                        <th>Severity</th><th>Enabled</th><th></th>
+                    </tr>
+                </thead>
+                <tbody id="tel-rule-rows"></tbody>
+            </table>
+        </div>
+
     	<div class="panel">
             <h2>Add Notification Channel</h2>
             <div class="panel-desc">Fires whenever a new detection reaches this severity or higher.</div>
