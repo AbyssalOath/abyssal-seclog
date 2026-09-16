@@ -20,6 +20,51 @@ use std::process::Command;
 #[cfg(all(target_os = "linux", feature = "telemetry"))]
 mod ebpf_linux;
 
+// Windows telemetry -- polls the Microsoft-Windows-Sysmon/Operational
+// event channel, same wire schema as ebpf_linux.rs (see
+// sysmon_windows.rs's own doc comment). Unlike the Linux sensor, this
+// needs NO new toolchain (no eBPF, no nightly, no bpf-linker) -- it's
+// wevtutil, exactly like watch_windows_security_log below -- so it's
+// gated only on target_os, not the `telemetry` Cargo feature: every
+// Windows shipper build already has it, runtime-activated the same way
+// as Linux (AgentConfigResponse.telemetry_enabled).
+#[cfg(target_os = "windows")]
+mod sysmon_windows;
+
+// Native-ETW fallback for Windows fleets that don't run Sysmon -- see
+// etw_windows.rs's own (extensive) doc comment, in particular the
+// verification-gap note at the top of it: this is the one part of
+// endpoint telemetry that could not be build-checked at all in the
+// environment it was written in. Gated only on target_os, same as
+// sysmon_windows -- no new toolchain either (the `ferrisetw` crate is
+// pure Rust + the `windows` crate, no C toolchain/SDK install needed),
+// just a normal Cargo dependency (see the root Cargo.toml's
+// `[target.'cfg(windows)'.dependencies]`).
+#[cfg(target_os = "windows")]
+mod etw_windows;
+
+// One call site for the reconciliation loop below regardless of which
+// platform/mechanism's sensor actually runs -- target_os is mutually
+// exclusive, so exactly one of these two definitions exists in any given
+// build.
+#[cfg(all(target_os = "linux", feature = "telemetry"))]
+async fn run_telemetry_sensor(base_url: String, api_key: String, host: String) {
+    ebpf_linux::run(base_url, api_key, host).await;
+}
+
+// Sysmon first, native ETW only if it's not installed -- see
+// sysmon_windows.rs's own module doc comment for why Sysmon is the
+// lower-risk default rather than a config choice the operator has to
+// make themselves.
+#[cfg(target_os = "windows")]
+async fn run_telemetry_sensor(base_url: String, api_key: String, host: String) {
+    if sysmon_windows::is_available() {
+        sysmon_windows::run(base_url, api_key, host).await;
+    } else {
+        etw_windows::run(base_url, api_key, host).await;
+    }
+}
+
 #[derive(Serialize)]
 struct NewLogEntry {
     severity: String,
@@ -487,7 +532,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Same idea as `active` above, but for the single telemetry sensor
     // task instead of a per-path map -- see the reconciliation loop below.
-    #[cfg(all(target_os = "linux", feature = "telemetry"))]
+    // One Option covers both platforms' sensors (never both at once,
+    // target_os is mutually exclusive) -- see run_telemetry_sensor.
+    #[cfg(any(all(target_os = "linux", feature = "telemetry"), target_os = "windows"))]
     let mut telemetry_handle: Option<JoinHandle<()>> = None;
 
     // Fetch our registered hostname once at startup -- this is what gets
@@ -546,24 +593,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // config.paths is moved out of below (partial move
                         // of a Copy field is fine either way, but doing it
                         // up top keeps this block self-contained).
-                        #[cfg(all(target_os = "linux", feature = "telemetry"))]
+                        #[cfg(any(all(target_os = "linux", feature = "telemetry"), target_os = "windows"))]
                         {
                             if config.telemetry_enabled && telemetry_handle.is_none() {
                                 let base = base_url.clone();
                                 let key = api_key.clone();
                                 let host = hostname.clone();
                                 telemetry_handle = Some(tokio::spawn(async move {
-                                    ebpf_linux::run(base, key, host).await;
+                                    run_telemetry_sensor(base, key, host).await;
                                 }));
-                                println!("Telemetry enabled by server config -- starting eBPF sensor");
+                                println!("Telemetry enabled by server config -- starting sensor");
                             } else if !config.telemetry_enabled
                                 && let Some(handle) = telemetry_handle.take()
                             {
                                 handle.abort();
-                                println!("Telemetry disabled by server config -- eBPF sensor stopped");
+                                println!("Telemetry disabled by server config -- sensor stopped");
                             }
                         }
-                        #[cfg(not(all(target_os = "linux", feature = "telemetry")))]
+                        #[cfg(not(any(all(target_os = "linux", feature = "telemetry"), target_os = "windows")))]
                         {
                             // No sensor available on this platform/build --
                             // the flag is still delivered by the server, we

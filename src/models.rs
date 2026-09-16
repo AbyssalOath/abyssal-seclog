@@ -202,7 +202,17 @@ pub struct NewTelemetryEvent {
     pub kind: String,
     pub host: String,
     pub pid: i64,
+    // Linux-only in practice: a real POSIX uid, or 0 as a "not
+    // applicable" sentinel for Windows sources (Windows has no uid
+    // concept at all) and for Linux's own module_load kind fired from a
+    // kernel-context callback with no attached uid. `user` below is
+    // the general, cross-platform identity field -- Windows populates it
+    // (a resolved DOMAIN\name or SID string from Sysmon's own `User`
+    // field), Linux leaves it None since uid already covers that role
+    // there.
     pub uid: i64,
+    #[serde(default)]
+    pub user: Option<String>,
     #[serde(default)]
     pub exe: Option<String>,
     #[serde(default)]
@@ -229,6 +239,7 @@ impl NewTelemetryEvent {
         ) && !self.host.trim().is_empty()
             && self.host.len() <= 255
             && self.exe.as_ref().is_none_or(|s| s.len() <= 1024)
+            && self.user.as_ref().is_none_or(|s| s.len() <= 255)
             && self.protocol.as_ref().is_none_or(|s| s.len() <= 10)
             && self.src_ip.as_ref().is_none_or(|s| s.len() <= 45)
             && self.dst_ip.as_ref().is_none_or(|s| s.len() <= 45)

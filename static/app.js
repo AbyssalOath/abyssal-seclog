@@ -386,7 +386,7 @@ async function loadAgents() {
         const telemetryCheckbox = document.createElement('input');
         telemetryCheckbox.type = 'checkbox';
         telemetryCheckbox.checked = agent.telemetry_enabled;
-        telemetryCheckbox.title = 'Real-time process/network sensor -- needs a Linux shipper built with --features telemetry';
+        telemetryCheckbox.title = 'Real-time process/network/file/module sensor -- Linux needs a shipper built with --features telemetry; Windows needs Sysmon installed and running (no special shipper build required)';
         telemetryCheckbox.onchange = () => toggleAgentTelemetry(agent.id, telemetryCheckbox.checked);
         telemetryCell.appendChild(telemetryCheckbox);
 
@@ -1581,16 +1581,29 @@ async function loadTelemetryPage() {
         const kindCell = document.createElement('td');
         kindCell.textContent = TELEMETRY_KIND_LABELS[event.kind] || event.kind;
         const pidCell = document.createElement('td');
-        pidCell.textContent = event.pid;
-        const uidCell = document.createElement('td');
-        uidCell.textContent = event.uid;
+        // -1 is module_load's "no process" sentinel on Windows (Driver
+        // load isn't tied to a specific process); 0 covers every other
+        // "not applicable" case (Linux module_load's kernel-context
+        // call, or just no data). Neither is a PID worth showing as a
+        // number.
+        pidCell.textContent = (event.pid > 0) ? event.pid : '-';
+        const userCell = document.createElement('td');
+        // Windows sends a resolved user string (DOMAIN\name); Linux
+        // sends a numeric uid instead (no user string), where 0 is a
+        // real, meaningful value (root) -- so unlike pid above, uid 0
+        // must still be shown, not treated as "no data". The one
+        // exception is Windows' module_load (DriverLoad), which has
+        // neither a user string nor a real uid; that case reads as
+        // "uid 0" here, a minor, documented imprecision (see
+        // sysmon_windows.rs) rather than a fully-disambiguated "N/A".
+        userCell.textContent = event.user || `uid ${event.uid}`;
         const detailsCell = document.createElement('td');
         detailsCell.textContent = formatTelemetryDetails(event);
 
         row.appendChild(timeCell);
         row.appendChild(kindCell);
         row.appendChild(pidCell);
-        row.appendChild(uidCell);
+        row.appendChild(userCell);
         row.appendChild(detailsCell);
         tbody.appendChild(row);
     }

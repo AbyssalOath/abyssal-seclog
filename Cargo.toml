@@ -91,3 +91,18 @@ anyhow = { version = "1", optional = true }
 aya-build = { version = "0.2.0", default-features = false, optional = true }
 cargo_metadata = { version = "0.23.0", default-features = false, optional = true }
 seclog-ebpf = { path = "seclog-ebpf", optional = true }
+
+# Windows-only, unconditionally (no `telemetry` feature gate needed --
+# unlike the Linux eBPF sensor, this needs no special toolchain): backs
+# src/bin/shipper/etw_windows.rs, the native-ETW fallback used when
+# Sysmon isn't installed (see sysmon_windows::is_available). A safe
+# Rust wrapper over the Win32 ETW consumer APIs (StartTrace/OpenTrace/
+# TdhGetEventInformation) -- the only maintained one, and what krabsetw
+# (Microsoft's own C++ ETW library) inspired. Target-gated so Cargo
+# never even attempts to resolve it on Linux/macOS. Deliberately placed
+# at the very end of this file: a `[target...]` table applies to every
+# key that follows it until the next `[table]` header, so putting it
+# anywhere earlier risks silently swallowing later dependencies into the
+# wrong table (hit and fixed while adding this).
+[target.'cfg(windows)'.dependencies]
+ferrisetw = "1.2"

@@ -5,9 +5,10 @@
     <div class="panel">
         <h2>Endpoint Telemetry</h2>
         <div class="panel-desc">
-            Real-time process-exec and network-connect events from the Linux eBPF sensor, for hosts
-            where it's been turned on (per-agent toggle on the Agents page). Raw event stream only --
-            there's no detection/scoring layered on this data yet.
+            Real-time process-exec, network-connect, file-write, and kernel-module-load events from
+            the endpoint sensor (Linux eBPF, or Windows via Sysmon), for hosts where it's been turned
+            on (per-agent toggle on the Agents page). Raw event stream -- see Settings &rarr; Alerts
+            &rarr; Telemetry Rules for threshold detection on top of it.
         </div>
 
         <label for="telemetry-host-select">Host:</label>
@@ -27,7 +28,7 @@
                     <th>Time</th>
                     <th>Kind</th>
                     <th>PID</th>
-                    <th>UID</th>
+                    <th>User</th>
                     <th>Details</th>
                 </tr>
             </thead>

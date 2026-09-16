@@ -460,17 +460,16 @@ password/private key) are encrypted with `SECLOG_MASTER_KEY` — the same
 mechanism and the same "write-only, shown once" contract already used
 for the LDAP bind password, see Directory sync above.
 
-## Endpoint telemetry (Linux, experimental)
+## Endpoint telemetry (Linux + Windows, experimental)
 
-Beyond log-line tailing, the shipper can optionally run a real-time eBPF
-sensor on Linux hosts, capturing four kinds of activity directly from the
-kernel — no text log involved: process-exec (command + args), new outbound
-network connections, writes to a small set of security-relevant files
-(`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `/etc/ssh/sshd_config`,
-`/etc/crontab`, `/root/.ssh/authorized_keys` — file-integrity monitoring),
-and kernel module loads. This is off by default and needs a shipper binary
-built with the `telemetry` Cargo feature (see **Development** below); a
-shipper without it simply never shows the toggle as usable.
+Beyond log-line tailing, the shipper can optionally report four kinds of
+activity in near-real-time — no text log involved: process-exec (command +
+args), new outbound network connections, writes to a small set of
+security-relevant files (file-integrity monitoring), and kernel module/driver
+loads. **Linux** gets this from a real eBPF sensor running in the kernel;
+**Windows** gets it by polling Sysmon (see below) — different mechanisms,
+identical schema and identical behavior everywhere else in the dashboard.
+macOS isn't supported yet.
 
 Once you have a telemetry-capable shipper deployed:
 
@@ -485,11 +484,22 @@ Once you have a telemetry-capable shipper deployed:
    minutes." Off by default, same as Correlation Rules but with no seeded
    defaults.
 
-Requires a kernel with BTF (`/sys/kernel/btf/vmlinux`, roughly 5.8+ on
-most distros) — a host without it logs a warning (with a ready-to-use
-`auditd` fallback rule set printed alongside it, see below) and simply
-doesn't start the sensor; every other shipper function keeps working
-normally. Delivery is best-effort (a batch that fails all retries is
+**Linux**: needs a shipper binary built with the `telemetry` Cargo feature
+(see **Development** below); a shipper without it simply never shows the
+toggle as usable. Also needs a kernel with BTF (`/sys/kernel/btf/vmlinux`,
+roughly 5.8+ on most distros) — a host without it logs a warning (with a
+ready-to-use `auditd` fallback rule set printed alongside it, see below) and
+simply doesn't start the sensor; every other shipper function keeps working
+normally.
+
+**Windows**: needs [Sysmon](https://learn.microsoft.com/sysinternals/downloads/sysmon)
+installed and configured to log event IDs 1 (process create), 3 (network
+connect), 6 (driver load), and 11 (file create) — no special shipper build,
+every Windows release already has this. [SwiftOnSecurity's Sysmon
+config](https://github.com/SwiftOnSecurity/sysmon-config) is a reasonable,
+widely-used starting point if you don't already have one.
+
+Delivery is best-effort on both platforms (a batch that fails all retries is
 dropped, unlike the log-tailing path's retry-until-success). See
 `ARCHITECTURE.md`'s "Endpoint telemetry" section for the full design.
 
@@ -518,6 +528,52 @@ reuses infrastructure this project already has. See ARCHITECTURE.md's
 "Auditd telemetry fallback" section for why matching on the `-k` key
 (rather than a syscall number, which differs by CPU architecture) is what
 makes this portable.
+
+### Windows telemetry (Sysmon)
+
+Windows telemetry works via [Sysmon](https://learn.microsoft.com/sysinternals/downloads/sysmon),
+not eBPF or native ETW (the latter is a possible later phase) — the shipper
+polls the `Microsoft-Windows-Sysmon/Operational` event log every 10 seconds
+via `wevtutil`, the same built-in tool it already uses for the Security event
+log. This is deliberately the lower-risk, lower-effort path: Sysmon's event
+schema is stable and extensively documented, and every Windows shipper
+build already includes it — no `telemetry` Cargo feature, no new toolchain,
+nothing to opt into at build time.
+
+Install Sysmon with a config that logs at least these event IDs (the four
+that map onto SecLog's telemetry schema):
+
+- **1** — Process creation
+- **3** — Network connection
+- **6** — Driver loaded
+- **11** — File created
+
+[SwiftOnSecurity's config](https://github.com/SwiftOnSecurity/sysmon-config)
+covers all four (and much more) out of the box, and is a reasonable default
+if you don't already run Sysmon with your own config. `sysmon64 -accepteula
+-i sysmonconfig.xml` installs the service using it.
+
+SecLog does not add its own path filtering on top of Sysmon's file-create
+events the way the Linux sensor does with its hardcoded watch list — Sysmon's
+own config already does that job, and is expected to.
+
+### Native ETW fallback (no Sysmon)
+
+If Sysmon isn't installed, the shipper automatically falls back to consuming
+two Windows kernel ETW providers directly (`Microsoft-Windows-Kernel-Process`,
+`Microsoft-Windows-Kernel-Network`) — nothing to configure, it's detected at
+telemetry startup. This is lower-fidelity than Sysmon in two specific ways:
+**process-exec events have no command-line arguments** (only the executable
+path — the raw kernel provider doesn't carry a command line the way Sysmon's
+own enrichment does), and **there's no file-write/FIM coverage at all** yet.
+Network-connect is also IPv4 only. If you can deploy Sysmon, it's the more
+complete option; this exists for fleets that can't or won't.
+
+⚠️ Unlike the rest of this project, this path has not been build-tested on
+an actual Windows machine — it was written and documented (see
+`ARCHITECTURE.md` § Native ETW fallback) without access to one. Build and
+verify it (`cargo build --bin shipper --target x86_64-pc-windows-msvc`) on
+a real Windows box before relying on it.
 
 ## Development
 

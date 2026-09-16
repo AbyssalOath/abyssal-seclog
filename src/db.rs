@@ -2651,6 +2651,18 @@ pub async fn init_telemetry_schema(pool: &DbPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Added after the table's initial release, so ADD COLUMN IF NOT
+    // EXISTS rather than folded into the CREATE TABLE above -- same
+    // idempotent-migration pattern as every other post-hoc column in
+    // this file (e.g. agents.telemetry_enabled). Windows' Sysmon-sourced
+    // events populate this (a resolved DOMAIN\name or SID string);
+    // Linux leaves it NULL since it already has a real `uid`. See
+    // NewTelemetryEvent's doc comment in models.rs for the full
+    // uid-vs-user split.
+    sqlx::query("ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS user VARCHAR(255) NULL")
+        .execute(pool)
+        .await?;
+
     // Backs both the per-host paginated view (GET /telemetry) and the
     // retention sweep's age-based delete -- same two-column shape as
     // idx_logs_host, for the same reason (without it both scale with total
@@ -2670,6 +2682,7 @@ pub struct TelemetryRow {
     pub kind: String,
     pub pid: i64,
     pub uid: i64,
+    pub user: Option<String>,
     pub exe: Option<String>,
     pub argv_json: Option<String>,
     pub src_ip: Option<String>,
@@ -2683,11 +2696,12 @@ pub struct TelemetryRow {
 
 fn telemetry_event_hash(host: &str, event: &NewTelemetryEvent, argv_json: Option<&str>) -> String {
     let combined = format!(
-        "{}{}{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}{}{}",
         event.kind,
         host,
         event.pid,
         event.uid,
+        event.user.as_deref().unwrap_or(""),
         event.exe.as_deref().unwrap_or(""),
         argv_json.unwrap_or(""),
         event.src_ip.as_deref().unwrap_or(""),
@@ -2711,7 +2725,7 @@ pub async fn insert_telemetry_batch(pool: &DbPool, host: &str, events: &[NewTele
     for chunk in events.chunks(200) {
         let mut qb: QueryBuilder<sqlx::MySql> = QueryBuilder::new(
             "INSERT IGNORE INTO telemetry_events \
-             (host, kind, pid, uid, exe, argv_json, src_ip, src_port, dst_ip, dst_port, protocol, event_hash, event_time) ",
+             (host, kind, pid, uid, user, exe, argv_json, src_ip, src_port, dst_ip, dst_port, protocol, event_hash, event_time) ",
         );
         qb.push_values(chunk, |mut b, event| {
             let argv_json = event.argv.as_ref().and_then(|a| serde_json::to_string(a).ok());
@@ -2720,6 +2734,7 @@ pub async fn insert_telemetry_batch(pool: &DbPool, host: &str, events: &[NewTele
                 .push_bind(&event.kind)
                 .push_bind(event.pid)
                 .push_bind(event.uid)
+                .push_bind(&event.user)
                 .push_bind(&event.exe)
                 .push_bind(argv_json)
                 .push_bind(&event.src_ip)
@@ -2747,7 +2762,7 @@ pub async fn get_telemetry_events(
     offset: i64,
 ) -> Result<Vec<TelemetryRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, host, kind, pid, uid, exe, argv_json, src_ip, src_port, dst_ip, dst_port,
+        "SELECT id, host, kind, pid, uid, user, exe, argv_json, src_ip, src_port, dst_ip, dst_port,
                 protocol, event_time, created_at
          FROM telemetry_events
          WHERE host = ? AND (? IS NULL OR kind = ?)

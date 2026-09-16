@@ -36,6 +36,11 @@ struct NewTelemetryEvent {
     host: String,
     pid: u32,
     uid: u32,
+    // Always None on Linux -- uid above already carries real identity;
+    // this exists for Windows' Sysmon-sourced events, which have no uid
+    // concept at all. See models::NewTelemetryEvent's doc comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exe: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +211,7 @@ fn to_wire_event(event: &TelemetryEvent, host: &str) -> NewTelemetryEvent {
         host: host.to_string(),
         pid: event.pid,
         uid: event.uid,
+        user: None,
         exe: None,
         argv: None,
         src_ip: None,

@@ -364,13 +364,19 @@ time, logging or alerting on large skew (see AU-5 above).
 IGNORE`, so a shipper retry after a dropped response never creates a
 duplicate row.
 
-## Endpoint telemetry (Linux eBPF: `seclog-ebpf`, `seclog-ebpf-common`, `src/bin/shipper/ebpf_linux.rs`)
+## Endpoint telemetry (Linux eBPF: `seclog-ebpf`, `seclog-ebpf-common`, `src/bin/shipper/ebpf_linux.rs`; Windows: `src/bin/shipper/sysmon_windows.rs`)
 
 Everything above this section is log-line tailing: reactive text parsing of
 files/commands that already exist. This is different in kind, not degree —
-a kernel-level sensor with no text log in the loop at all, giving direct
-visibility into process-exec and outbound-network-connect activity a text
-log might never capture. It's a separate workspace (`seclog-ebpf-common`,
+structured, near-real-time process/network/file/module activity, not a
+text log the shipper happens to be watching. Two platform-specific
+implementations feed the identical `telemetry_events` schema
+(`models::NewTelemetryEvent`) — Linux via a real kernel sensor (eBPF),
+Windows via polling Sysmon's own event log (see "Windows telemetry"
+below for why that's a deliberately different, lower-risk mechanism
+rather than a from-scratch ETW consumer). macOS has neither yet.
+
+The Linux sensor is a separate workspace (`seclog-ebpf-common`,
 `seclog-ebpf` as members alongside the root `seclog` package) and an
 off-by-default Cargo feature (`telemetry`) — building it needs the
 `bpfel-unknown-none` target, a nightly toolchain (`-Z build-std=core`), and
@@ -536,6 +542,140 @@ shipper's telemetry task prints the exact recommended `auditctl` rules
 to stderr the moment it detects it can't load the real sensor (see
 `ebpf_linux::run`), rather than requiring the operator to already know
 to look here.
+
+### Windows telemetry (`src/bin/shipper/sysmon_windows.rs`)
+
+Sysmon-first, not native ETW: polls the `Microsoft-Windows-Sysmon/Operational`
+event channel via `wevtutil qe ... /f:xml` every 10s, the same tool
+`watch_windows_security_log` already uses for the Security channel (just
+XML output instead of that function's `/f:text`, since telemetry needs
+specific named fields pulled out unambiguously — see the module's own
+comment on why `/f:text` would leave "which `User:` line is the real
+one" ambiguous). Needs [Sysmon](https://learn.microsoft.com/sysinternals/downloads/sysmon)
+installed and configured to log event IDs 1/3/6/11; nothing else about
+the shipper changes. Unlike the Linux sensor, this needs **no new
+toolchain at all** — no eBPF, no nightly, no `bpf-linker` — so it's
+gated only on `target_os = "windows"`, not the `telemetry` Cargo
+feature: every Windows shipper build already has it (see
+`.github/workflows/release.yml` — the Windows leg's `cargo_features` is
+empty, unlike Linux's `--features telemetry`), runtime-activated the exact
+same way as Linux (`AgentConfigResponse.telemetry_enabled`,
+`main.rs`'s `run_telemetry_sensor` dispatching to whichever platform's
+implementation is actually compiled in).
+
+Maps four Sysmon event IDs onto the same four kinds the Linux sensor
+covers, deliberately not any of Sysmon's other ~20 event types (ImageLoad,
+CreateRemoteThread, registry events, etc. — a later phase, not this one):
+`ProcessCreate` (1) → `process_exec`, `NetworkConnect` (3) →
+`network_connect`, `FileCreate` (11) → `file_write`, `DriverLoad` (6) →
+`module_load` (reusing the `exe` wire field for the driver's file path,
+same field-reuse convention as the Linux sensor's own file_write/module_load).
+`CommandLine` ships as a single-element `argv` rather than being tokenized
+into separate arguments the way execve's real argv is — Windows command-line
+parsing has its own quoting rules (`CommandLineToArgvW`'s), distinct from a
+shell's, and getting that wrong would be worse than not splitting at all.
+
+Deliberately does **not** re-filter `FileCreate` events against a
+hardcoded watched-path list the way `seclog-ebpf`'s `file_write` does on
+Linux: Sysmon already has its own mature, widely-deployed config system
+for exactly this (SwiftOnSecurity's popular baseline config, or an
+operator's own) — reimplementing that here would be redundant with, and
+could silently diverge from, whatever the operator already configured
+Sysmon to log. What Sysmon reports, per its own config, is what ships.
+
+Events are parsed with plain regex over each `<Event>...</Event>`
+fragment, not a real XML parser: `wevtutil qe ... /f:xml` emits
+back-to-back event fragments with no enclosing root for multiple
+results (a well-known wevtutil quirk), so this never tries to parse the
+whole output as one document — it splits on `</Event>` and pulls
+`<Data Name="X">value</Data>` pairs out of each fragment independently,
+which works the same whether or not a future wevtutil version ever does
+wrap the output in a root element.
+
+Two identity fields exist for exactly this platform split:
+`NewTelemetryEvent.uid` (a real POSIX uid on Linux, always `0`/`-1` on
+Windows) and `.user` (a resolved `DOMAIN\name` string, populated only by
+Windows — Sysmon's own `User` field — and always absent on Linux, which
+already has `uid`). `DriverLoad` carries neither a `ProcessId` nor a
+`User` at all (a kernel-level driver load isn't tied to a specific
+process) — its `pid` is `-1`, not the `0` every other "not applicable"
+case uses, specifically because `0` is System Idle Process, an actual
+(if unusual) real Windows PID, so it isn't a safe sentinel there the way
+it is on Linux.
+
+Every poll re-fetches the last 50 events and re-ships them rather than
+tracking a last-seen `EventRecordID` to query only what's new —
+deliberately matching `watch_windows_security_log`'s own existing
+"re-fetch + rely on server-side `event_hash` dedup (`INSERT IGNORE`)"
+shape exactly, instead of introducing a second, untested incremental-query
+mechanism. Known, accepted inefficiency at this poll count/interval; an
+`EventRecordID`-based `/q:` XPath filter is the natural next optimization
+if fleet-scale Sysmon volume ever makes the redundant traffic worth
+avoiding, not a redesign.
+
+### Native ETW fallback (`src/bin/shipper/etw_windows.rs`)
+
+For Windows fleets that don't run Sysmon: `main.rs`'s `run_telemetry_sensor`
+calls `sysmon_windows::is_available()` (a cheap `wevtutil gl
+Microsoft-Windows-Sysmon/Operational` — succeeds the moment Sysmon's
+manifest is registered, regardless of whether it's actively logging) once
+at telemetry startup, and falls back to this module if that fails. Sysmon
+stays the default specifically because it's the lower-risk path — see its
+own module doc comment — not because this one is deprecated; some fleets
+genuinely can't or won't deploy Sysmon, and this covers them without a new
+per-agent setting for the operator to reason about.
+
+Uses [`ferrisetw`](https://github.com/n4r1b/ferrisetw) — a safe Rust
+wrapper over the Win32 ETW consumer APIs
+(`StartTrace`/`OpenTrace`/`ProcessTrace`/TDH parsing), the only maintained
+one, and what Microsoft's own `krabsetw` (C++) inspired — to consume two
+modern, manifest-based kernel providers directly, no Sysmon involved:
+`Microsoft-Windows-Kernel-Process` (`ProcessStart` → `process_exec`,
+`ImageLoad` filtered to PID 4/System → `module_load`, same PID-based
+kernel-vs-user-mode distinction `seclog-ebpf`'s own Linux `module_load`
+uses) and `Microsoft-Windows-Kernel-Network` (`TCPIPConnectionattempted`,
+IPv4 only → `network_connect`). No `file_write` coverage: the FileIo
+kernel provider's Create/Write events are two of the more notoriously
+awkward ETW event classes to consume correctly (a Create event and the
+actual filename live in separate records that need correlating by
+`FileKey`/`FileObject`), and that complexity was judged not worth shipping
+unverified — see the note below. Every provider GUID, EventID, and field
+name is taken from the actual published ETW manifests for these two
+providers ([Kernel-Process](https://github.com/repnz/etw-providers-docs/blob/master/Manifests-Win10-17134/Microsoft-Windows-Kernel-Process.xml),
+[Kernel-Network](https://github.com/repnz/etw-providers-docs/blob/master/Manifests-Win10-17134/Microsoft-Windows-Kernel-Network.xml)),
+cross-referenced against `ferrisetw`'s own maintainer-provided examples
+for the actual Rust call shapes — not guessed.
+
+Architecturally: `UserTrace::start_and_process()` spawns its own
+background OS thread internally and returns immediately (confirmed by
+reading `ferrisetw`'s source, not inferred from an example alone) — the
+trace handle it returns is held as a local for the rest of `run()`'s
+lifetime, so aborting the surrounding tokio task (the same
+`telemetry_handle.take().unwrap().abort()` the reconciliation loop already
+uses for every other telemetry mechanism) drops that local, which
+`ferrisetw` documents as stopping the trace automatically. No special-casing
+needed in `main.rs` beyond the existing dispatch. The two provider
+callbacks run on that background thread, not on any tokio worker, so they
+hand parsed events to the async side through a `tokio::sync::mpsc`
+unbounded channel (`UnboundedSender::send` is a plain sync, non-blocking
+method — safe to call from any thread) rather than doing anything async
+directly; the receiving side batches and ships on the same
+timer-or-`MAX_BATCH`-whichever-first shape `ebpf_linux.rs` already uses.
+
+**Verification note, unlike everything else in this codebase**: this file
+could not be build-checked at all in the environment it was written in —
+no Windows box, and unlike `sysmon_windows.rs` (platform-independent logic
+under a thin `wevtutil` shell-out, compilable and clippy-able natively on
+Linux under a temporary module alias), `ferrisetw` and the `windows` crate
+it wraps only compile for an actual Windows target — there's no
+platform-independent core to isolate. Three different attempts at real
+Windows cross-compilation in this environment (a local mingw toolchain
+with no root to install it; two different Docker-based cross-toolchain
+container setups, each hitting a different, unrelated infrastructure
+issue rather than anything about this code) were made and abandoned. Build
+and test this specifically — `cargo build --bin shipper --target
+x86_64-pc-windows-msvc` on a real Windows machine or CI runner — before
+relying on it operationally.
 
 ## Data flow, end to end
 

@@ -32,23 +32,33 @@ the Git tags (`vX.Y.Z`) that trigger shipper release builds.
 
 ### Added
 
-- **Endpoint telemetry (Linux, experimental)**: an optional eBPF sensor in
-  the shipper captures process-exec (command + args), new outbound
-  network connections, writes to a small set of security-relevant files
-  (file-integrity monitoring), and kernel module loads directly from the
-  kernel, independent of any text log. Off by default, both at the build
-  level (`telemetry` Cargo feature — see README § Building the shipper
-  with the telemetry sensor) and per-agent (Agents page toggle). Raw
-  event stream on the new **Telemetry** page, plus threshold detection
-  over it (Settings → Alerts → **Telemetry Rules**, same shape as
-  Correlation Rules but matching on event kind + `exe`/`dst_port` instead
-  of a `[Label]` prefix) — opt-in per rule, no seeded defaults. Hosts
-  whose kernel can't run the sensor at all (no BTF) get a documented,
+- **Endpoint telemetry (Linux + Windows, experimental)**: process-exec
+  (command + args), new outbound network connections, writes to a small
+  set of security-relevant files (file-integrity monitoring), and kernel
+  module/driver loads, in near-real-time, independent of any text log.
+  **Linux**: a real eBPF sensor in the shipper, off by default at the
+  build level (`telemetry` Cargo feature — see README § Building the
+  shipper with the telemetry sensor). **Windows**: polls Sysmon's own
+  event log via `wevtutil` (needs Sysmon installed, logging event IDs
+  1/3/6/11 — no special shipper build, every Windows release already
+  has it), automatically falling back to consuming
+  `Microsoft-Windows-Kernel-Process`/`-Network` ETW providers directly
+  (via `ferrisetw`) when Sysmon isn't installed — lower-fidelity (no
+  process-exec argv, no file-write coverage, network IPv4 only) but
+  needs nothing installed or configured; unverified on a real Windows
+  machine, see README/ARCHITECTURE.md for details. Both platforms feed
+  the identical schema and are toggled the
+  same way (per-agent, Agents page). Raw event stream on the new
+  **Telemetry** page, plus threshold detection over it (Settings →
+  Alerts → **Telemetry Rules**, same shape as Correlation Rules but
+  matching on event kind + `exe`/`dst_port` instead of a `[Label]`
+  prefix) — opt-in per rule, no seeded defaults. Linux hosts whose
+  kernel can't run the sensor at all (no BTF) get a documented,
   lower-fidelity `auditd`-based fallback instead — four new detection
   labels over `type=SYSCALL` lines tagged with recommended `-k` keys, via
   the existing log-tailing pipeline and Correlation Rules, not a second
   sensor implementation.
-  See [ARCHITECTURE.md § Endpoint telemetry](ARCHITECTURE.md#endpoint-telemetry-linux-ebpf-seclog-ebpf-seclog-ebpf-common-srcbinshipperebpf_linuxrs)
+  See [ARCHITECTURE.md § Endpoint telemetry](ARCHITECTURE.md#endpoint-telemetry-linux-ebpf-seclog-ebpf-seclog-ebpf-common-srcbinshipperebpf_linuxrs-windows-srcbinshippersysmon_windowsrs)
   and § Telemetry rules for the full design. (new
   `seclog-ebpf`/`seclog-ebpf-common` workspace crates, `telemetry_events`
   and `telemetry_rules` tables, `POST /telemetry/batch`, `GET /telemetry`,
